@@ -229,7 +229,14 @@ class ScopeStreamer:
         if self.capturing:
             self.timer.stop()
             self.start_stop_btn.setText('Start Capture')
+            print(f"Capture stopped. Saved to {self.current_capture_dir}")
         else:
+            # Create new capture directory
+            timestamp = datetime.now().strftime("%Y_%m_%d_%H:%M:%S")
+            self.current_capture_dir = self.capture_dir / f"cap_{timestamp}"
+            self.current_capture_dir.mkdir(exist_ok=True)
+            print(f"Starting capture to {self.current_capture_dir}")
+            
             self.timer.start(self.interval)
             self.start_stop_btn.setText('Stop Capture')
         self.capturing = not self.capturing
@@ -262,7 +269,7 @@ class ScopeStreamer:
 
     def _save_capture(self, waveform):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
-        filename = self.capture_dir / f"{self.channel}_{timestamp}.npy"
+        filename = self.current_capture_dir / f"{self.channel}_{timestamp}.npy"
         np.save(filename, waveform.astype(np.float32))
 
     def run(self):
