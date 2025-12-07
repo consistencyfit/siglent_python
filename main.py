@@ -121,6 +121,7 @@ class ScopeStreamer:
 
         self.channel = channel
         self.interval = interval
+        self.capturing = True
         self.sock = None
         self._closing = False
 
@@ -148,13 +149,25 @@ class ScopeStreamer:
         self.signal_timer = QtCore.QTimer()
         self.signal_timer.timeout.connect(lambda: None)
         self.signal_timer.start(100)
-        self.win = pg.GraphicsLayoutWidget(title=f'Siglent Oscilloscope - {channel} Live Stream')
+        self.win = QtWidgets.QWidget()
+        self.win.setWindowTitle(f'Siglent Oscilloscope - {channel} Live Stream')
         self.win.resize(1200, 600)
-        self.win.setBackground('#2b2b2b')
         self.win.closeEvent = self._handle_close_event
 
+        main_layout = QtWidgets.QVBoxLayout(self.win)
+        controls_layout = QtWidgets.QHBoxLayout()
+        self.start_stop_btn = QtWidgets.QPushButton('Stop Capture')
+        self.start_stop_btn.clicked.connect(self.toggle_capture)
+        controls_layout.addWidget(self.start_stop_btn)
+        controls_layout.addStretch(1)
+        main_layout.addLayout(controls_layout)
+
+        self.plot_widget = pg.GraphicsLayoutWidget()
+        self.plot_widget.setBackground('#2b2b2b')
+        main_layout.addWidget(self.plot_widget)
+
         # Create plot
-        self.plot = self.win.addPlot(title=f'{channel} Live Stream')
+        self.plot = self.plot_widget.addPlot(title=f'{channel} Live Stream')
         self.plot.setLabel('left', 'Voltage', units='V')
         self.plot.setLabel('bottom', 'Sample')
         self.plot.showGrid(x=True, y=True, alpha=0.3)
@@ -206,6 +219,17 @@ class ScopeStreamer:
     def _handle_close_event(self, event):
         self.cleanup()
         event.accept()
+
+    def toggle_capture(self):
+        if not hasattr(self, 'timer'):
+            return
+        if self.capturing:
+            self.timer.stop()
+            self.start_stop_btn.setText('Start Capture')
+        else:
+            self.timer.start(self.interval)
+            self.start_stop_btn.setText('Stop Capture')
+        self.capturing = not self.capturing
 
     def update(self):
         try:
