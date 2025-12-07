@@ -2,6 +2,8 @@ import socket
 import signal
 import sys
 import time
+from datetime import datetime
+from pathlib import Path
 import numpy as np
 import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore, QtWidgets, QtGui
@@ -121,9 +123,11 @@ class ScopeStreamer:
 
         self.channel = channel
         self.interval = interval
-        self.capturing = True
+        self.capturing = False
         self.sock = None
         self._closing = False
+        self.capture_dir = Path('captures')
+        self.capture_dir.mkdir(exist_ok=True)
 
         # Connect to scope
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -156,7 +160,7 @@ class ScopeStreamer:
 
         main_layout = QtWidgets.QVBoxLayout(self.win)
         controls_layout = QtWidgets.QHBoxLayout()
-        self.start_stop_btn = QtWidgets.QPushButton('Stop Capture')
+        self.start_stop_btn = QtWidgets.QPushButton('Start Capture')
         self.start_stop_btn.clicked.connect(self.toggle_capture)
         controls_layout.addWidget(self.start_stop_btn)
         controls_layout.addStretch(1)
@@ -185,7 +189,6 @@ class ScopeStreamer:
         # Set up timer for updates
         self.timer = QtCore.QTimer()
         self.timer.timeout.connect(self.update)
-        self.timer.start(interval)
         self.close_shortcut = QtGui.QShortcut(
             QtGui.QKeySequence(QtGui.QKeySequence.StandardKey.Close), self.win
         )
@@ -232,10 +235,13 @@ class ScopeStreamer:
         self.capturing = not self.capturing
 
     def update(self):
+        if not self.capturing:
+            return
         try:
             waveform = get_waveform(self.sock, self.channel)
             if len(waveform) > 0:
                 self.curve.setData(waveform)
+                self._save_capture(waveform)
 
                 # Update X range to match data length
                 self.plot.setXRange(0, len(waveform), padding=0)
@@ -253,6 +259,11 @@ class ScopeStreamer:
 
         except Exception as e:
             print(f"Error reading waveform: {e}")
+
+    def _save_capture(self, waveform):
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
+        filename = self.capture_dir / f"{self.channel}_{timestamp}.npy"
+        np.save(filename, waveform.astype(np.float32))
 
     def run(self):
         try:
