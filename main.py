@@ -4,7 +4,7 @@ import sys
 import time
 import numpy as np
 import pyqtgraph as pg
-from pyqtgraph.Qt import QtCore, QtWidgets
+from pyqtgraph.Qt import QtCore, QtWidgets, QtGui
 
 scope_ip = '192.168.1.142'
 port = 5025  # SCPI port for Siglent scopes
@@ -122,6 +122,7 @@ class ScopeStreamer:
         self.channel = channel
         self.interval = interval
         self.sock = None
+        self._closing = False
 
         # Connect to scope
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -150,6 +151,7 @@ class ScopeStreamer:
         self.win = pg.GraphicsLayoutWidget(title=f'Siglent Oscilloscope - {channel} Live Stream')
         self.win.resize(1200, 600)
         self.win.setBackground('#2b2b2b')
+        self.win.closeEvent = self._handle_close_event
 
         # Create plot
         self.plot = self.win.addPlot(title=f'{channel} Live Stream')
@@ -171,6 +173,10 @@ class ScopeStreamer:
         self.timer = QtCore.QTimer()
         self.timer.timeout.connect(self.update)
         self.timer.start(interval)
+        self.close_shortcut = QtGui.QShortcut(
+            QtGui.QKeySequence(QtGui.QKeySequence.StandardKey.Close), self.win
+        )
+        self.close_shortcut.activated.connect(self.win.close)
 
         # Frame rate tracking
         self.last_time = time.time()
@@ -185,12 +191,21 @@ class ScopeStreamer:
         sys.exit(0)
 
     def cleanup(self):
-        self.timer.stop()
-        self.signal_timer.stop()
+        if self._closing:
+            return
+        self._closing = True
+        if hasattr(self, 'timer'):
+            self.timer.stop()
+        if hasattr(self, 'signal_timer'):
+            self.signal_timer.stop()
         if self.sock:
             self.sock.close()
             self.sock = None
         self.app.quit()
+
+    def _handle_close_event(self, event):
+        self.cleanup()
+        event.accept()
 
     def update(self):
         try:
