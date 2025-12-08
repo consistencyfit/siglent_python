@@ -6,3 +6,10 @@ dependencies = [
     "pyqt6>=6.10.1",
     "pyqtgraph>=0.14.0",
 ]
+
+[tool.setuptools]
+packages = ["src"]
+
+[project.scripts]
+osc_capture = "capture:main"
+osc_replay = "replay:main"
