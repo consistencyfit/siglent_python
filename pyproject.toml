@@ -8,7 +8,8 @@ dependencies = [
 ]
 
 [tool.setuptools]
-packages = ["src"]
+package-dir = {"" = "src"}
+py-modules = ["capture", "replay"]
 
 [project.scripts]
 osc_capture = "capture:main"

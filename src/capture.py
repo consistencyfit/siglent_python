@@ -285,7 +285,7 @@ def stream_waveform(channel='C1', interval=50, ip=None):
     streamer.run()
 
 
-if __name__ == '__main__':
+def main():
     import argparse
     parser = argparse.ArgumentParser(description='Stream waveform from Siglent oscilloscope')
     parser.add_argument('-c', '--channel', default='C1', help='Channel to stream (default: C1)')
@@ -295,3 +295,6 @@ if __name__ == '__main__':
 
     print(f"Connecting to Siglent scope at {args.ip}...")
     stream_waveform(channel=args.channel, interval=args.interval, ip=args.ip)
+
+if __name__ == '__main__':
+    main()

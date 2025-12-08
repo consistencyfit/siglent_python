@@ -106,7 +106,7 @@ class ReplayPlayer:
     def run(self):
         self.app.exec()
 
-if __name__ == '__main__':
+def main():
     parser = argparse.ArgumentParser(description='Replay captured waveforms')
     parser.add_argument('directory', help='Directory containing .npy capture files')
     parser.add_argument('--fps', type=int, default=30, help='Playback FPS')
@@ -115,3 +115,6 @@ if __name__ == '__main__':
     
     player = ReplayPlayer(args.directory, fps=args.fps)
     player.run()
+
+if __name__ == '__main__':
+    main()
