@@ -2,6 +2,7 @@ import socket
 import signal
 import sys
 import time
+import threading
 from datetime import datetime
 from pathlib import Path
 import numpy as np
@@ -115,6 +116,43 @@ def get_waveform(sock, channel='C1'):
     return voltage
 
 
+class CaptureWorker(QtCore.QObject):
+    """Worker that runs network operations in a background thread."""
+    waveform_ready = QtCore.pyqtSignal(np.ndarray)
+    error_occurred = QtCore.pyqtSignal(str)
+
+    def __init__(self, sock, channel):
+        super().__init__()
+        self.sock = sock
+        self.channel = channel
+        self._stop_event = threading.Event()
+        self._running = False
+
+    def stop(self):
+        """Signal the worker to stop. This is thread-safe and returns immediately."""
+        self._stop_event.set()
+
+    def is_stopped(self):
+        return self._stop_event.is_set()
+
+    def reset(self):
+        """Reset the stop event for a new capture session."""
+        self._stop_event.clear()
+
+    @QtCore.pyqtSlot()
+    def run_capture(self):
+        """Fetch a single waveform. Called by timer in the worker thread."""
+        if self._stop_event.is_set():
+            return
+        try:
+            waveform = get_waveform(self.sock, self.channel)
+            if not self._stop_event.is_set() and len(waveform) > 0:
+                self.waveform_ready.emit(waveform)
+        except Exception as e:
+            if not self._stop_event.is_set():
+                self.error_occurred.emit(str(e))
+
+
 class ScopeStreamer:
     def __init__(self, channel='C1', interval=50, ip=None):
         global scope_ip
@@ -186,9 +224,23 @@ class ScopeStreamer:
             center = -(scale_cache['offset'] or 0)
             self.plot.setYRange(center - yrange, center + yrange)
 
-        # Set up timer for updates
-        self.timer = QtCore.QTimer()
-        self.timer.timeout.connect(self.update)
+        # Set up worker thread for non-blocking captures
+        self.worker_thread = QtCore.QThread()
+        self.worker = CaptureWorker(self.sock, self.channel)
+        self.worker.moveToThread(self.worker_thread)
+
+        # Timer runs in worker thread to trigger captures
+        self.capture_timer = QtCore.QTimer()
+        self.capture_timer.moveToThread(self.worker_thread)
+        self.capture_timer.timeout.connect(self.worker.run_capture)
+
+        # Connect worker signals to UI slots
+        self.worker.waveform_ready.connect(self._on_waveform_ready)
+        self.worker.error_occurred.connect(self._on_error)
+
+        # Start worker thread
+        self.worker_thread.start()
+
         self.close_shortcut = QtGui.QShortcut(
             QtGui.QKeySequence(QtGui.QKeySequence.StandardKey.Close), self.win
         )
@@ -210,8 +262,20 @@ class ScopeStreamer:
         if self._closing:
             return
         self._closing = True
-        if hasattr(self, 'timer'):
-            self.timer.stop()
+
+        # Stop the worker and timer
+        if hasattr(self, 'worker'):
+            self.worker.stop()
+        if hasattr(self, 'capture_timer'):
+            QtCore.QMetaObject.invokeMethod(
+                self.capture_timer, 'stop', QtCore.Qt.ConnectionType.QueuedConnection
+            )
+
+        # Quit and wait for worker thread
+        if hasattr(self, 'worker_thread') and self.worker_thread.isRunning():
+            self.worker_thread.quit()
+            self.worker_thread.wait(1000)  # Wait up to 1 second
+
         if hasattr(self, 'signal_timer'):
             self.signal_timer.stop()
         if self.sock:
@@ -224,10 +288,12 @@ class ScopeStreamer:
         event.accept()
 
     def toggle_capture(self):
-        if not hasattr(self, 'timer'):
-            return
         if self.capturing:
-            self.timer.stop()
+            # Stop immediately - signal worker to stop, then stop timer
+            self.worker.stop()
+            QtCore.QMetaObject.invokeMethod(
+                self.capture_timer, 'stop', QtCore.Qt.ConnectionType.QueuedConnection
+            )
             self.start_stop_btn.setText('Start Capture')
             print(f"Capture stopped. Saved to {self.current_capture_dir}")
         else:
@@ -236,36 +302,41 @@ class ScopeStreamer:
             self.current_capture_dir = self.capture_dir / f"cap_{timestamp}"
             self.current_capture_dir.mkdir(exist_ok=True)
             print(f"Starting capture to {self.current_capture_dir}")
-            
-            self.timer.start(self.interval)
+
+            # Reset worker stop flag and start timer in worker thread
+            self.worker.reset()
+            QtCore.QMetaObject.invokeMethod(
+                self.capture_timer, 'start', QtCore.Qt.ConnectionType.QueuedConnection,
+                QtCore.Q_ARG(int, self.interval)
+            )
             self.start_stop_btn.setText('Stop Capture')
         self.capturing = not self.capturing
 
-    def update(self):
+    @QtCore.pyqtSlot(np.ndarray)
+    def _on_waveform_ready(self, waveform):
+        """Handle waveform data from worker thread (runs on main thread)."""
         if not self.capturing:
             return
-        try:
-            waveform = get_waveform(self.sock, self.channel)
-            if len(waveform) > 0:
-                self.curve.setData(waveform)
-                self._save_capture(waveform)
 
-                # Update X range to match data length
-                self.plot.setXRange(0, len(waveform), padding=0)
+        self.curve.setData(waveform)
+        self._save_capture(waveform)
+        self.plot.setXRange(0, len(waveform), padding=0)
 
-            # FPS tracking
-            self.fps_counter += 1
-            now = time.time()
-            if now - self.last_time >= 1.0:
-                self.fps = self.fps_counter
-                self.fps_counter = 0
-                self.last_time = now
-                self.win.setWindowTitle(
-                    f'Siglent Oscilloscope - {self.channel} Live Stream ({self.fps} fps)'
-                )
+        # FPS tracking
+        self.fps_counter += 1
+        now = time.time()
+        if now - self.last_time >= 1.0:
+            self.fps = self.fps_counter
+            self.fps_counter = 0
+            self.last_time = now
+            self.win.setWindowTitle(
+                f'Siglent Oscilloscope - {self.channel} Live Stream ({self.fps} fps)'
+            )
 
-        except Exception as e:
-            print(f"Error reading waveform: {e}")
+    @QtCore.pyqtSlot(str)
+    def _on_error(self, error_msg):
+        """Handle errors from worker thread."""
+        print(f"Error reading waveform: {error_msg}")
 
     def _save_capture(self, waveform):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
