@@ -1,3 +1,5 @@
+import atexit
+import logging
 import socket
 import signal
 import sys
@@ -8,6 +10,13 @@ from pathlib import Path
 import numpy as np
 import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore, QtWidgets, QtGui
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s.%(msecs)03d %(levelname)s: %(message)s',
+    datefmt='%H:%M:%S'
+)
+log = logging.getLogger(__name__)
 
 scope_ip = '192.168.1.142'
 port = 5025  # SCPI port for Siglent scopes
@@ -20,22 +29,52 @@ def send_command(sock, cmd):
     sock.sendall((cmd + '\n').encode())
     time.sleep(0.05)
 
-def query(sock, cmd, timeout=2):
+def query(sock, cmd, timeout=2, delay=0.05):
     """Send a query and return the response."""
     sock.sendall((cmd + '\n').encode())
     sock.settimeout(timeout)
-    time.sleep(0.1)
+    time.sleep(delay)
+
     response = b''
+    expected_length = None
+
     try:
         while True:
             chunk = sock.recv(65536)
             if not chunk:
                 break
             response += chunk
-            if len(chunk) < 65536:
+
+            # Look for IEEE 488.2 header near the START of response (within first 50 bytes)
+            # The response format is: "C1:WF DAT2,#9000001400<binary_data>\n"
+            if expected_length is None:
+                # Find '#' only in the header portion (first 50 bytes)
+                header_portion = response[:50]
+                if b'#' in header_portion:
+                    hash_pos = response.find(b'#')
+                    if len(response) > hash_pos + 2:
+                        try:
+                            num_digits = int(chr(response[hash_pos + 1]))
+                            if num_digits > 0 and len(response) > hash_pos + 2 + num_digits:
+                                length_str = response[hash_pos + 2:hash_pos + 2 + num_digits]
+                                data_length = int(length_str)
+                                # Total: everything up to data + data + trailing newlines
+                                expected_length = hash_pos + 2 + num_digits + data_length + 2
+                                log.debug(f"Expecting {expected_length} total bytes ({data_length} data bytes)")
+                        except (ValueError, IndexError):
+                            pass
+
+            # If we know expected length, check if we have enough
+            if expected_length and len(response) >= expected_length:
                 break
+
+            # Fallback: if chunk is small and we have some data, assume done
+            if len(chunk) < 65536 and len(response) > 100:
+                break
+
     except socket.timeout:
-        pass
+        log.debug(f"Query timeout after receiving {len(response)} bytes")
+
     return response
 
 def parse_value(response):
@@ -66,13 +105,45 @@ def get_scale_params(sock, channel='C1'):
 
     return scale_cache['vdiv'], scale_cache['offset']
 
+def setup_waveform_transfer(sock, channel='C1', num_points=1400, memory_depth=7000000):
+    """Configure waveform transfer parameters for faster streaming."""
+    # Calculate sparsing to get approximately num_points from memory_depth
+    sparsing = max(1, memory_depth // num_points)
+    # WFSU: SP=sparsing, NP=num points, FP=first point, SN=sequence number
+    send_command(sock, f'WFSU SP,{sparsing},NP,{num_points},FP,0,SN,0')
+    log.info(f"Configured waveform transfer: {num_points} points, sparsing {sparsing}")
+
+
 def get_waveform(sock, channel='C1'):
     """Retrieve waveform data from the specified channel."""
-    # Get the actual waveform data
-    data_raw = query(sock, f'{channel}:WF? DAT2', timeout=3)
+    t0 = time.time()
+
+    # Clear the INR register first
+    sock.sendall(b'INR?\n')
+    time.sleep(0.01)
+    try:
+        sock.recv(1024)  # Discard response
+    except:
+        pass
+
+    # Wait for new acquisition (bit 0 of INR = new signal acquired)
+    for _ in range(50):  # Max 500ms wait
+        sock.sendall(b'INR?\n')
+        time.sleep(0.01)
+        try:
+            resp = sock.recv(1024)
+            inr_val = int(resp.decode().strip().split()[-1])
+            if inr_val & 1:  # Bit 0 set = new data
+                break
+        except:
+            pass
+
+    data_raw = query(sock, f'{channel}:WF? DAT2', timeout=1.0, delay=0.02)
+    log.debug(f"Query took {time.time()-t0:.3f}s, got {len(data_raw)} bytes")
 
     # Parse the binary block data (IEEE 488.2 format: #NXXXXXXXX<data>)
     if b'#' not in data_raw:
+        log.warning(f"No '#' in response, first 50 bytes: {data_raw[:50]}")
         return np.array([])
 
     hash_pos = data_raw.find(b'#')
@@ -83,6 +154,7 @@ def get_waveform(sock, channel='C1'):
     try:
         num_digits = int(chr(data_raw[hash_pos + 1]))
     except ValueError:
+        log.warning(f"Invalid num_digits at pos {hash_pos+1}")
         return np.array([])
 
     if len(data_raw) <= hash_pos + 2 + num_digits:
@@ -93,13 +165,20 @@ def get_waveform(sock, channel='C1'):
     try:
         data_length = int(length_str)
     except ValueError:
+        log.warning(f"Invalid data_length: {length_str}")
         return np.array([])
 
     data_start = hash_pos + 2 + num_digits
     waveform_data = data_raw[data_start:data_start + data_length]
 
+    if len(waveform_data) < data_length:
+        log.warning(f"Incomplete data: got {len(waveform_data)}, expected {data_length}")
+        return np.array([])
+
     if len(waveform_data) < 2:
         return np.array([])
+
+    log.debug(f"Parsed waveform: {len(waveform_data)} bytes")
 
     # Remove trailing garbage bytes (usually 2)
     if len(waveform_data) > 2:
@@ -113,6 +192,8 @@ def get_waveform(sock, channel='C1'):
     values = np.frombuffer(waveform_data, dtype=np.int8)
     voltage = (values.astype(float) * vdiv / 25.0) - offset
 
+    # Log first 10 raw values to check if data is actually changing
+    log.debug(f"First 10 raw: {list(values[:10])} | Range: {voltage.min():.4f} to {voltage.max():.4f}")
     return voltage
 
 
@@ -126,7 +207,7 @@ class CaptureWorker(QtCore.QObject):
         self.sock = sock
         self.channel = channel
         self._stop_event = threading.Event()
-        self._running = False
+        self._busy = False  # Guard against overlapping queries
 
     def stop(self):
         """Signal the worker to stop. This is thread-safe and returns immediately."""
@@ -142,8 +223,9 @@ class CaptureWorker(QtCore.QObject):
     @QtCore.pyqtSlot()
     def run_capture(self):
         """Fetch a single waveform. Called by timer in the worker thread."""
-        if self._stop_event.is_set():
+        if self._stop_event.is_set() or self._busy:
             return
+        self._busy = True
         try:
             waveform = get_waveform(self.sock, self.channel)
             if not self._stop_event.is_set() and len(waveform) > 0:
@@ -151,6 +233,8 @@ class CaptureWorker(QtCore.QObject):
         except Exception as e:
             if not self._stop_event.is_set():
                 self.error_occurred.emit(str(e))
+        finally:
+            self._busy = False
 
 
 class ScopeStreamer:
@@ -161,7 +245,8 @@ class ScopeStreamer:
 
         self.channel = channel
         self.interval = interval
-        self.capturing = False
+        self.streaming = False  # Display only mode
+        self.capturing = False  # Display + save mode
         self.sock = None
         self._closing = False
         self.capture_dir = Path('captures')
@@ -174,11 +259,17 @@ class ScopeStreamer:
 
         # Query scope ID
         idn = query(self.sock, '*IDN?')
-        print(f"Connected to: {idn.decode().strip()}")
+        log.info(f"Connected to: {idn.decode().strip()}")
 
         # Get initial scale parameters
         vdiv, offset = get_scale_params(self.sock, channel)
-        print(f"V/div: {vdiv}, Offset: {offset}")
+        log.info(f"V/div: {vdiv}, Offset: {offset}")
+
+        # Ensure scope is running in auto trigger mode
+        send_command(self.sock, 'TRMD AUTO')
+        log.info("Scope set to AUTO trigger mode")
+
+
 
         # Set up pyqtgraph
         pg.setConfigOptions(antialias=False, useOpenGL=True)
@@ -198,9 +289,35 @@ class ScopeStreamer:
 
         main_layout = QtWidgets.QVBoxLayout(self.win)
         controls_layout = QtWidgets.QHBoxLayout()
-        self.start_stop_btn = QtWidgets.QPushButton('Start Capture')
-        self.start_stop_btn.clicked.connect(self.toggle_capture)
-        controls_layout.addWidget(self.start_stop_btn)
+
+        # Stream button (display only, no saving)
+        self.stream_btn = QtWidgets.QPushButton('Start Stream')
+        self.stream_btn.clicked.connect(self.toggle_stream)
+        controls_layout.addWidget(self.stream_btn)
+
+        # Capture button (display + save to disk)
+        self.capture_btn = QtWidgets.QPushButton('Start Capture')
+        self.capture_btn.clicked.connect(self.toggle_capture)
+        controls_layout.addWidget(self.capture_btn)
+
+        controls_layout.addSpacing(20)
+
+        # Frequency slider
+        freq_label = QtWidgets.QLabel('Update freq:')
+        controls_layout.addWidget(freq_label)
+
+        self.freq_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        self.freq_slider.setMinimum(1)    # 1 Hz
+        self.freq_slider.setMaximum(50)   # 50 Hz
+        self.freq_slider.setValue(1000 // interval)  # Convert ms to Hz
+        self.freq_slider.setFixedWidth(150)
+        self.freq_slider.valueChanged.connect(self._on_freq_changed)
+        controls_layout.addWidget(self.freq_slider)
+
+        self.freq_value_label = QtWidgets.QLabel(f'{1000 // interval} Hz')
+        self.freq_value_label.setFixedWidth(50)
+        controls_layout.addWidget(self.freq_value_label)
+
         controls_layout.addStretch(1)
         main_layout.addLayout(controls_layout)
 
@@ -241,6 +358,9 @@ class ScopeStreamer:
         # Start worker thread
         self.worker_thread.start()
 
+        # Register cleanup on exit
+        atexit.register(self.cleanup)
+
         self.close_shortcut = QtGui.QShortcut(
             QtGui.QKeySequence(QtGui.QKeySequence.StandardKey.Close), self.win
         )
@@ -254,7 +374,7 @@ class ScopeStreamer:
         self.win.show()
 
     def _signal_handler(self, signum, frame):
-        print("\nExiting...")
+        log.info("Exiting...")
         self.cleanup()
         sys.exit(0)
 
@@ -268,59 +388,120 @@ class ScopeStreamer:
             self.worker.stop()
         if hasattr(self, 'capture_timer'):
             QtCore.QMetaObject.invokeMethod(
-                self.capture_timer, 'stop', QtCore.Qt.ConnectionType.QueuedConnection
+                self.capture_timer, 'stop', QtCore.Qt.ConnectionType.BlockingQueuedConnection
             )
 
         # Quit and wait for worker thread
         if hasattr(self, 'worker_thread') and self.worker_thread.isRunning():
             self.worker_thread.quit()
-            self.worker_thread.wait(1000)  # Wait up to 1 second
+            self.worker_thread.wait(2000)  # Wait up to 2 seconds
 
         if hasattr(self, 'signal_timer'):
             self.signal_timer.stop()
+
+        # Properly close the socket connection
         if self.sock:
-            self.sock.close()
-            self.sock = None
+            try:
+                # Clear any pending data and close gracefully
+                self.sock.settimeout(0.1)
+                try:
+                    while self.sock.recv(4096):
+                        pass
+                except:
+                    pass
+                self.sock.shutdown(socket.SHUT_RDWR)
+            except:
+                pass
+            finally:
+                self.sock.close()
+                self.sock = None
+
         self.app.quit()
 
     def _handle_close_event(self, event):
         self.cleanup()
         event.accept()
 
-    def toggle_capture(self):
-        if self.capturing:
-            # Stop immediately - signal worker to stop, then stop timer
-            self.worker.stop()
+    def _on_freq_changed(self, value):
+        """Handle frequency slider change."""
+        self.interval = 1000 // value  # Convert Hz to ms
+        self.freq_value_label.setText(f'{value} Hz')
+
+        # If currently running, update the timer interval
+        if self.streaming or self.capturing:
             QtCore.QMetaObject.invokeMethod(
-                self.capture_timer, 'stop', QtCore.Qt.ConnectionType.QueuedConnection
+                self.capture_timer, 'setInterval', QtCore.Qt.ConnectionType.QueuedConnection,
+                QtCore.Q_ARG(int, self.interval)
             )
-            self.start_stop_btn.setText('Start Capture')
-            print(f"Capture stopped. Saved to {self.current_capture_dir}")
+
+    def _start_timer(self):
+        """Start the capture timer in the worker thread."""
+        self.worker.reset()
+        QtCore.QMetaObject.invokeMethod(
+            self.capture_timer, 'start', QtCore.Qt.ConnectionType.QueuedConnection,
+            QtCore.Q_ARG(int, self.interval)
+        )
+
+    def _stop_timer(self):
+        """Stop the capture timer."""
+        self.worker.stop()
+        QtCore.QMetaObject.invokeMethod(
+            self.capture_timer, 'stop', QtCore.Qt.ConnectionType.QueuedConnection
+        )
+
+    def toggle_stream(self):
+        """Toggle streaming mode (display only, no saving)."""
+        if self.streaming:
+            self._stop_timer()
+            self.stream_btn.setText('Start Stream')
+            self.capture_btn.setEnabled(True)
+            self.streaming = False
         else:
+            # Stop capture if running
+            if self.capturing:
+                self.toggle_capture()
+
+            self._start_timer()
+            self.stream_btn.setText('Stop Stream')
+            self.capture_btn.setEnabled(False)
+            self.streaming = True
+
+    def toggle_capture(self):
+        """Toggle capture mode (display + save to disk)."""
+        if self.capturing:
+            self._stop_timer()
+            self.capture_btn.setText('Start Capture')
+            self.stream_btn.setEnabled(True)
+            log.info(f"Capture stopped. Saved to {self.current_capture_dir}")
+            self.capturing = False
+        else:
+            # Stop streaming if running
+            if self.streaming:
+                self.toggle_stream()
+
             # Create new capture directory
             timestamp = datetime.now().strftime("%Y_%m_%d_%H:%M:%S")
             self.current_capture_dir = self.capture_dir / f"cap_{timestamp}"
             self.current_capture_dir.mkdir(exist_ok=True)
-            print(f"Starting capture to {self.current_capture_dir}")
+            log.info(f"Starting capture to {self.current_capture_dir}")
 
-            # Reset worker stop flag and start timer in worker thread
-            self.worker.reset()
-            QtCore.QMetaObject.invokeMethod(
-                self.capture_timer, 'start', QtCore.Qt.ConnectionType.QueuedConnection,
-                QtCore.Q_ARG(int, self.interval)
-            )
-            self.start_stop_btn.setText('Stop Capture')
-        self.capturing = not self.capturing
+            self._start_timer()
+            self.capture_btn.setText('Stop Capture')
+            self.stream_btn.setEnabled(False)
+            self.capturing = True
 
-    @QtCore.pyqtSlot(np.ndarray)
     def _on_waveform_ready(self, waveform):
         """Handle waveform data from worker thread (runs on main thread)."""
-        if not self.capturing:
+        if not self.streaming and not self.capturing:
             return
 
+        # Update display
         self.curve.setData(waveform)
-        self._save_capture(waveform)
         self.plot.setXRange(0, len(waveform), padding=0)
+
+        # Only save when capturing
+        if self.capturing:
+            self._save_capture(waveform)
 
         # FPS tracking
         self.fps_counter += 1
@@ -329,14 +510,14 @@ class ScopeStreamer:
             self.fps = self.fps_counter
             self.fps_counter = 0
             self.last_time = now
+            mode = 'Capturing' if self.capturing else 'Streaming'
             self.win.setWindowTitle(
-                f'Siglent Oscilloscope - {self.channel} Live Stream ({self.fps} fps)'
+                f'Siglent Oscilloscope - {self.channel} [{mode}] ({self.fps} fps)'
             )
 
-    @QtCore.pyqtSlot(str)
     def _on_error(self, error_msg):
         """Handle errors from worker thread."""
-        print(f"Error reading waveform: {error_msg}")
+        log.error(f"Error reading waveform: {error_msg}")
 
     def _save_capture(self, waveform):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
@@ -364,7 +545,7 @@ def main():
     parser.add_argument('--ip', default=scope_ip, help=f'Scope IP address (default: {scope_ip})')
     args = parser.parse_args()
 
-    print(f"Connecting to Siglent scope at {args.ip}...")
+    log.info(f"Connecting to Siglent scope at {args.ip}...")
     stream_waveform(channel=args.channel, interval=args.interval, ip=args.ip)
 
 if __name__ == '__main__':
