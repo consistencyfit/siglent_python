@@ -148,15 +148,19 @@ def main():
         send_command(sock, 'TRDL -0.12')
         time.sleep(0.1)
 
-        # Set trigger mode to NORMAL
-        print("Setting trigger mode: NORMAL")
-        send_command(sock, 'TRMD NORM')
-        time.sleep(0.1)
-
         # Configure trigger
         print(f"Setting trigger: {args.trigger_source} @ {args.trigger_level}V")
         send_command(sock, f'TRSE EDGE,SR,{args.trigger_source},HT,OFF')  # Edge trigger on source
         send_command(sock, f'{args.trigger_source}:TRLV {args.trigger_level}V')  # Trigger level
+        time.sleep(0.1)
+
+        # Set trigger mode to NORMAL (do this last!)
+        print("Setting trigger mode: NORMAL")
+        send_command(sock, 'TRMD NORM')
+        time.sleep(0.3)
+        # Verify it took effect
+        mode = query(sock, 'TRMD?')
+        print(f"  Confirmed trigger mode: {mode}")
 
         # Verify settings
         print("\nVerifying settings:")
@@ -196,15 +200,8 @@ def main():
                 print("Error: No data received from screen capture")
         else:
             print("No trigger occurred within timeout period")
-            # Switch back to AUTO mode
-            send_command(sock, 'TRMD AUTO')
 
     finally:
-        # Restore AUTO trigger mode and close socket
-        try:
-            send_command(sock, 'TRMD AUTO')
-        except:
-            pass
         sock.close()
         print("Connection closed")
 
