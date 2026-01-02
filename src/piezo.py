@@ -21,10 +21,25 @@ SCOPE_IP = '192.168.1.142'
 PORT = 5025
 
 
-def send_command(sock, cmd):
-    """Send a command to the scope."""
+def send_command(sock, cmd, wait=True):
+    """Send a command to the scope, optionally waiting for completion using *OPC?."""
     sock.sendall((cmd + '\n').encode())
-    time.sleep(0.05)
+    if wait:
+        # Wait for operation complete by querying *OPC?
+        # The scope returns "1\n" when the previous command has finished
+        sock.sendall(b'*OPC?\n')
+        sock.settimeout(5)
+        response = b''
+        try:
+            while True:
+                chunk = sock.recv(256)
+                if not chunk:
+                    break
+                response += chunk
+                if response.endswith(b'\n'):
+                    break
+        except socket.timeout:
+            pass
 
 
 def query(sock, cmd, timeout=2):
@@ -477,49 +492,35 @@ def main():
         send_command(sock, 'MSIZ 14M')
         # Get ~14000 points, then interpolate 4x for smooth display
         send_command(sock, 'WFSU SP,1000,NP,14000,FP,0')
-        time.sleep(0.2)
 
         # Configure CH1
         print(f"Setting CH1: {args.ch1_vdiv*1000:.0f}mV/div, centered at 0V")
-        send_command(sock, 'C1:TRA ON')  # Enable CH1 trace
-        time.sleep(0.1)
+        send_command(sock, 'C1:TRA ON')
         send_command(sock, f'C1:VDIV {args.ch1_vdiv}')
-        time.sleep(0.1)
-        send_command(sock, 'C1:OFST 0')  # Center at 0V
-        time.sleep(0.1)
-        query(sock, 'C1:VDIV?')  # Force processing
+        send_command(sock, 'C1:OFST 0')
 
         # Configure CH2
         print(f"Setting CH2: {args.ch2_vdiv*1000:.0f}mV/div, centered at 0V")
-        send_command(sock, 'C2:TRA ON')  # Enable CH2 trace
-        time.sleep(0.1)
+        send_command(sock, 'C2:TRA ON')
         send_command(sock, f'C2:VDIV {args.ch2_vdiv}')
-        time.sleep(0.1)
-        send_command(sock, 'C2:OFST 0')  # Center at 0V
-        time.sleep(0.1)
-        query(sock, 'C2:VDIV?')  # Force processing
+        send_command(sock, 'C2:OFST 0')
 
         # Configure horizontal (time/div)
         print(f"Setting horizontal: {args.hdiv*1000:.0f}ms/div")
         send_command(sock, f'TDIV {args.hdiv}')
-        time.sleep(0.1)
 
         # Set horizontal delay (negative = left shift)
         print("Setting horizontal delay: -120ms (left shift)")
         send_command(sock, 'TRDL -0.12')
-        time.sleep(0.1)
 
         # Configure trigger
         print(f"Setting trigger: {args.trigger_source} @ {args.trigger_level}V")
-        send_command(sock, f'TRSE EDGE,SR,{args.trigger_source},HT,OFF')  # Edge trigger on source
-        send_command(sock, f'{args.trigger_source}:TRLV {args.trigger_level}V')  # Trigger level
-        time.sleep(0.1)
+        send_command(sock, f'TRSE EDGE,SR,{args.trigger_source},HT,OFF')
+        send_command(sock, f'{args.trigger_source}:TRLV {args.trigger_level}V')
 
         # Set trigger mode to NORMAL (do this last!)
         print("Setting trigger mode: NORMAL")
         send_command(sock, 'TRMD NORM')
-        time.sleep(0.3)
-        # Verify it took effect
         mode = query(sock, 'TRMD?')
         print(f"  Confirmed trigger mode: {mode}")
 

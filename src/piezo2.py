@@ -15,6 +15,7 @@ from scipy.signal import hilbert
 from scipy.interpolate import CubicSpline
 import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore, QtWidgets, QtGui
+import pyqtgraph.exporters
 
 # Enable antialiasing for smoother lines (like matplotlib)
 pg.setConfigOptions(antialias=True)
@@ -23,10 +24,25 @@ SCOPE_IP = '192.168.1.142'
 PORT = 5025
 
 
-def send_command(sock, cmd):
-    """Send a command to the scope."""
+def send_command(sock, cmd, wait=True):
+    """Send a command to the scope, optionally waiting for completion using *OPC?."""
     sock.sendall((cmd + '\n').encode())
-    time.sleep(0.05)
+    if wait:
+        # Wait for operation complete by querying *OPC?
+        # The scope returns "1\n" when the previous command has finished
+        sock.sendall(b'*OPC?\n')
+        sock.settimeout(5)
+        response = b''
+        try:
+            while True:
+                chunk = sock.recv(256)
+                if not chunk:
+                    break
+                response += chunk
+                if response.endswith(b'\n'):
+                    break
+        except socket.timeout:
+            pass
 
 
 def query(sock, cmd, timeout=2):
@@ -269,10 +285,6 @@ class PiezoCapture(QtWidgets.QMainWindow):
         self.start_btn.clicked.connect(self._toggle_capture)
         controls.addWidget(self.start_btn)
 
-        self.arm_btn = QtWidgets.QPushButton('Re-arm Trigger')
-        self.arm_btn.clicked.connect(self._arm_trigger)
-        controls.addWidget(self.arm_btn)
-
         controls.addSpacing(20)
 
         controls.addWidget(QtWidgets.QLabel('Captures:'))
@@ -384,18 +396,18 @@ class PiezoCapture(QtWidgets.QMainWindow):
         self.plot_ch1 = self.graphics.addPlot(row=0, col=0, title='CH1 Waveform + Envelope')
         self.plot_ch1.setLabel('left', 'Voltage', units='mV')
         self.plot_ch1.showGrid(x=True, y=True, alpha=0.3)
-        self.curve_ch1 = self.plot_ch1.plot(pen=pg.mkPen('y', width=1))
-        self.curve_ch1_env_upper = self.plot_ch1.plot(pen=pg.mkPen('r', width=2))
-        self.curve_ch1_env_lower = self.plot_ch1.plot(pen=pg.mkPen('r', width=2))
+        self.curve_ch1 = self.plot_ch1.plot(pen=pg.mkPen(color=(255, 255, 0, 180), width=0.5))
+        self.curve_ch1_env_upper = self.plot_ch1.plot(pen=pg.mkPen('r', width=1.5))
+        self.curve_ch1_env_lower = self.plot_ch1.plot(pen=pg.mkPen('r', width=1.5))
 
         # CH2 waveform + envelope
         self.plot_ch2 = self.graphics.addPlot(row=1, col=0, title='CH2 Waveform + Envelope')
         self.plot_ch2.setLabel('left', 'Voltage', units='mV')
         self.plot_ch2.setLabel('bottom', 'Time', units='ms')
         self.plot_ch2.showGrid(x=True, y=True, alpha=0.3)
-        self.curve_ch2 = self.plot_ch2.plot(pen=pg.mkPen('c', width=1))
-        self.curve_ch2_env_upper = self.plot_ch2.plot(pen=pg.mkPen('m', width=2))
-        self.curve_ch2_env_lower = self.plot_ch2.plot(pen=pg.mkPen('m', width=2))
+        self.curve_ch2 = self.plot_ch2.plot(pen=pg.mkPen(color=(0, 255, 255, 180), width=0.5))
+        self.curve_ch2_env_upper = self.plot_ch2.plot(pen=pg.mkPen('m', width=1.5))
+        self.curve_ch2_env_lower = self.plot_ch2.plot(pen=pg.mkPen('m', width=1.5))
 
         # FFT plots
         self.plot_fft1 = self.graphics.addPlot(row=0, col=1, title='CH1 FFT')
@@ -440,46 +452,32 @@ class PiezoCapture(QtWidgets.QMainWindow):
         """Configure scope settings."""
         send_command(self.sock, 'SCSV OFF')
 
-        # Set memory depth
+        # Set memory depth and decimation
         send_command(self.sock, 'MSIZ 14M')
-        time.sleep(0.1)
-        # Apply decimation settings
         self._apply_waveform_settings()
-        time.sleep(0.1)
 
         # Configure CH1
         print(f"Setting CH1: {self.ch1_vdiv*1000:.0f}mV/div, centered at 0V")
         send_command(self.sock, 'C1:TRA ON')
-        time.sleep(0.1)
         send_command(self.sock, f'C1:VDIV {self.ch1_vdiv}')
-        time.sleep(0.1)
         send_command(self.sock, 'C1:OFST 0')
-        time.sleep(0.1)
-        query(self.sock, 'C1:VDIV?')  # Force processing
 
         # Configure CH2
         print(f"Setting CH2: {self.ch2_vdiv*1000:.0f}mV/div, centered at 0V")
         send_command(self.sock, 'C2:TRA ON')
-        time.sleep(0.1)
         send_command(self.sock, f'C2:VDIV {self.ch2_vdiv}')
-        time.sleep(0.1)
         send_command(self.sock, 'C2:OFST 0')
-        time.sleep(0.1)
-        query(self.sock, 'C2:VDIV?')  # Force processing
 
         # Horizontal
         print(f"Setting horizontal: {self.hdiv*1000:.0f}ms/div")
         send_command(self.sock, f'TDIV {self.hdiv}')
-        time.sleep(0.1)
         print("Setting horizontal delay: -120ms (left shift)")
         send_command(self.sock, 'TRDL -0.12')
-        time.sleep(0.1)
 
         # Trigger
         print(f"Setting trigger: C1 @ {self.trigger_level}V")
         send_command(self.sock, 'TRSE EDGE,SR,C1,HT,OFF')
         send_command(self.sock, f'C1:TRLV {self.trigger_level}V')
-        time.sleep(0.1)
 
         # Verify settings
         print("\nVerifying settings:")
@@ -667,6 +665,14 @@ class PiezoCapture(QtWidgets.QMainWindow):
         # Save correlation
         with open(self.captures_dir / f"corr_{timestamp}.json", 'w') as f:
             json.dump(corr, f, indent=2)
+
+        # Save plot image
+        try:
+            exporter = pyqtgraph.exporters.ImageExporter(self.graphics.scene())
+            exporter.parameters()['width'] = 1400
+            exporter.export(str(self.captures_dir / f"plot_{timestamp}.png"))
+        except Exception as e:
+            print(f"  Warning: Could not save plot image: {e}")
 
         print(f"Saved capture: {timestamp}")
 
