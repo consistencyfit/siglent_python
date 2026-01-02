@@ -511,8 +511,33 @@ class PiezoCapture(QtWidgets.QMainWindow):
 
     def _do_initial_capture(self):
         """Capture current waveform to fill plots on startup."""
-        # Skip - plots will fill on first trigger
-        pass
+        if not self.sock:
+            return
+
+        print("Initial capture to fill plots...")
+
+        # Put scope in AUTO, wait for full acquisition cycle, then stop
+        send_command(self.sock, 'TRMD AUTO', wait=False)
+        time.sleep(1.5)  # Wait for full acquisition at 20ms/div * 14 = 280ms, plus margin
+        send_command(self.sock, 'STOP', wait=False)
+        time.sleep(0.2)
+
+        # Now read waveforms
+        upsample = self.upsample_factor if self.interpolate_enabled else 1
+        wf1, _ = get_waveform(self.sock, 'C1', self.ch1_vdiv, upsample=upsample)
+        wf2, _ = get_waveform(self.sock, 'C2', self.ch2_vdiv, upsample=upsample)
+
+        print(f"  CH1: {len(wf1)} samples, CH2: {len(wf2)} samples")
+
+        if len(wf1) > 0 and len(wf2) > 0:
+            env1 = compute_envelope(wf1, smooth_window=self.envelope_smooth)
+            env2 = compute_envelope(wf2, smooth_window=self.envelope_smooth)
+            self._update_plots(wf1, env1, wf2, env2)
+            corr = analyze_correlation(env1, env2, wf1, wf2)
+            self._update_correlation_display(corr)
+            print("  Initial capture successful")
+        else:
+            print("  No data - plots will fill on first trigger")
 
     def _update_correlation_display(self, corr):
         """Update the correlation panel labels."""
