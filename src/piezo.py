@@ -5,6 +5,7 @@ Trigger capture script for Siglent oscilloscopes.
 Configures the scope with specified settings and saves a capture when the trigger fires.
 """
 import argparse
+import json
 import socket
 import sys
 import time
@@ -144,6 +145,128 @@ def compute_envelope(signal):
     analytic_signal = hilbert(signal)
     envelope = np.abs(analytic_signal)
     return envelope
+
+
+def fft_correlate(a, b):
+    """Fast cross-correlation using FFT."""
+    n = len(a) + len(b) - 1
+    # Pad to power of 2 for efficiency
+    n_fft = 1 << (n - 1).bit_length()
+    fft_a = np.fft.fft(a, n_fft)
+    fft_b = np.fft.fft(b, n_fft)
+    corr = np.fft.ifft(fft_a * np.conj(fft_b)).real
+    return corr[:n]
+
+
+def analyze_correlation(env1, env2, wf1, wf2, sample_rate=None):
+    """
+    Analyze correlation between two channels.
+
+    Returns a dict with correlation metrics and a classification.
+    """
+    # Ensure same length
+    min_len = min(len(env1), len(env2))
+    env1, env2 = env1[:min_len], env2[:min_len]
+    wf1, wf2 = wf1[:min_len], wf2[:min_len]
+
+    # Downsample if too long (for speed)
+    max_samples = 10000
+    if min_len > max_samples:
+        factor = min_len // max_samples
+        env1_ds = env1[::factor]
+        env2_ds = env2[::factor]
+        wf1_ds = wf1[::factor]
+        wf2_ds = wf2[::factor]
+    else:
+        env1_ds, env2_ds = env1, env2
+        wf1_ds, wf2_ds = wf1, wf2
+        factor = 1
+
+    # Normalize envelopes for comparison
+    env1_norm = env1_ds / (np.max(env1_ds) + 1e-10)
+    env2_norm = env2_ds / (np.max(env2_ds) + 1e-10)
+
+    # 1. Pearson correlation of envelopes
+    pearson_env = np.corrcoef(env1_ds, env2_ds)[0, 1]
+
+    # 2. Pearson correlation of raw waveforms
+    pearson_wf = np.corrcoef(wf1_ds, wf2_ds)[0, 1]
+
+    # 3. Normalized cross-correlation of envelopes (FFT-based for speed)
+    ncc = fft_correlate(env1_norm, env2_norm)
+    ncc_peak = np.max(ncc)
+    ncc_lag = (np.argmax(ncc) - (len(env1_ds) - 1)) * factor  # Lag in samples
+
+    # 4. Peak timing difference
+    peak1_idx = np.argmax(env1)
+    peak2_idx = np.argmax(env2)
+    peak_lag_samples = peak1_idx - peak2_idx
+
+    # 5. Peak amplitude ratio
+    peak1_amp = np.max(env1)
+    peak2_amp = np.max(env2)
+    amplitude_ratio = min(peak1_amp, peak2_amp) / (max(peak1_amp, peak2_amp) + 1e-10)
+
+    # 6. RMS ratio
+    rms1 = np.sqrt(np.mean(wf1**2))
+    rms2 = np.sqrt(np.mean(wf2**2))
+    rms_ratio = min(rms1, rms2) / (max(rms1, rms2) + 1e-10)
+
+    # 7. Envelope shape similarity (cosine similarity)
+    cosine_sim = np.dot(env1_norm, env2_norm) / (np.linalg.norm(env1_norm) * np.linalg.norm(env2_norm) + 1e-10)
+
+    # 8. Decay rate similarity (fit exponential decay after peak)
+    def estimate_decay(env, peak_idx):
+        """Estimate decay constant from envelope after peak."""
+        decay_region = env[peak_idx:peak_idx + len(env)//4]
+        if len(decay_region) < 10:
+            return 0
+        decay_region = decay_region / (decay_region[0] + 1e-10)
+        # Simple log-linear fit
+        valid = decay_region > 0.01
+        if np.sum(valid) < 5:
+            return 0
+        log_decay = np.log(decay_region[valid] + 1e-10)
+        x = np.arange(np.sum(valid))
+        if len(x) > 1:
+            slope = np.polyfit(x, log_decay, 1)[0]
+            return slope
+        return 0
+
+    decay1 = estimate_decay(env1, peak1_idx)
+    decay2 = estimate_decay(env2, peak2_idx)
+    decay_similarity = 1 - abs(decay1 - decay2) / (abs(decay1) + abs(decay2) + 1e-10)
+
+    # Composite correlation score (weighted average)
+    correlation_score = (
+        0.30 * pearson_env +
+        0.25 * cosine_sim +
+        0.20 * amplitude_ratio +
+        0.15 * decay_similarity +
+        0.10 * (1 - min(abs(peak_lag_samples), 100) / 100)  # Penalize large timing differences
+    )
+
+    # Classification
+    if correlation_score > 0.7:
+        classification = "CORRELATED"
+    elif correlation_score > 0.4:
+        classification = "WEAKLY_CORRELATED"
+    else:
+        classification = "UNCORRELATED"
+
+    return {
+        'pearson_envelope': float(pearson_env),
+        'pearson_waveform': float(pearson_wf),
+        'ncc_peak': float(ncc_peak),
+        'ncc_lag_samples': int(ncc_lag),
+        'peak_lag_samples': int(peak_lag_samples),
+        'amplitude_ratio': float(amplitude_ratio),
+        'rms_ratio': float(rms_ratio),
+        'cosine_similarity': float(cosine_sim),
+        'decay_similarity': float(decay_similarity),
+        'correlation_score': float(correlation_score),
+        'classification': classification,
+    }
 
 
 def plot_waveform_with_envelope(waveform, envelope, tdiv, channel='C1', save_path=None):
@@ -362,6 +485,26 @@ def main():
                 env1 = compute_envelope(wf1)
                 env2 = compute_envelope(wf2)
 
+                # Analyze correlation
+                print("\n" + "="*50)
+                print("CORRELATION ANALYSIS")
+                print("="*50)
+                corr = analyze_correlation(env1, env2, wf1, wf2)
+
+                print(f"  Pearson (envelope):    {corr['pearson_envelope']:.3f}")
+                print(f"  Pearson (waveform):    {corr['pearson_waveform']:.3f}")
+                print(f"  Cosine similarity:     {corr['cosine_similarity']:.3f}")
+                print(f"  NCC peak:              {corr['ncc_peak']:.3f}")
+                print(f"  NCC lag (samples):     {corr['ncc_lag_samples']}")
+                print(f"  Peak lag (samples):    {corr['peak_lag_samples']}")
+                print(f"  Amplitude ratio:       {corr['amplitude_ratio']:.3f}")
+                print(f"  RMS ratio:             {corr['rms_ratio']:.3f}")
+                print(f"  Decay similarity:      {corr['decay_similarity']:.3f}")
+                print("-"*50)
+                print(f"  CORRELATION SCORE:     {corr['correlation_score']:.3f}")
+                print(f"  CLASSIFICATION:        {corr['classification']}")
+                print("="*50 + "\n")
+
                 # Determine output path
                 captures_dir = Path('captures')
                 captures_dir.mkdir(exist_ok=True)
@@ -376,6 +519,12 @@ def main():
                 np.save(captures_dir / f"ch1_envelope_{timestamp}.npy", env1.astype(np.float32))
                 np.save(captures_dir / f"ch2_envelope_{timestamp}.npy", env2.astype(np.float32))
                 print(f"Saved envelopes to: captures/ch*_envelope_{timestamp}.npy")
+
+                # Save correlation results
+                corr_file = captures_dir / f"correlation_{timestamp}.json"
+                with open(corr_file, 'w') as f:
+                    json.dump(corr, f, indent=2)
+                print(f"Saved correlation analysis to: {corr_file}")
 
                 # Plot both channels with envelopes
                 plot_path = captures_dir / f"plot_{timestamp}.png"
