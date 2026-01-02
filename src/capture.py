@@ -471,6 +471,8 @@ class ScopeStreamer:
             if self.capturing:
                 self.toggle_capture()
 
+            # Keep scope screen on during streaming
+            send_command(self.sock, 'SCSV OFF')
             self._start_timer()
             self.stream_btn.setText('Stop Stream')
             self.capture_btn.setEnabled(False)
@@ -495,6 +497,8 @@ class ScopeStreamer:
             self.current_capture_dir.mkdir(exist_ok=True)
             log.info(f"Starting capture to {self.current_capture_dir}")
 
+            # Keep scope screen on during capture
+            send_command(self.sock, 'SCSV OFF')
             self._start_timer()
             self.capture_btn.setText('Stop Capture')
             self.stream_btn.setEnabled(False)
