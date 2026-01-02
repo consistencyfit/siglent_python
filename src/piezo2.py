@@ -238,6 +238,58 @@ def analyze_correlation(env1, env2, wf1, wf2):
     }
 
 
+class SpinnerOverlay(QtWidgets.QWidget):
+    """Semi-transparent overlay with spinning indicator and text."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._text = "Loading..."
+        self._angle = 0
+        self._timer = QtCore.QTimer(self)
+        self._timer.timeout.connect(self._rotate)
+        self.hide()
+
+    def start(self, text="Loading..."):
+        """Show spinner with given text."""
+        self._text = text
+        self._angle = 0
+        self.show()
+        self.raise_()
+        self._timer.start(50)
+
+    def stop(self):
+        """Hide spinner."""
+        self._timer.stop()
+        self.hide()
+
+    def _rotate(self):
+        self._angle = (self._angle + 30) % 360
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+
+        # Semi-transparent background
+        painter.fillRect(self.rect(), QtGui.QColor(0, 0, 0, 150))
+
+        center = self.rect().center()
+
+        # Draw spinning arc
+        painter.setPen(QtGui.QPen(QtGui.QColor(100, 100, 100), 4))
+        arc_rect = QtCore.QRectF(center.x() - 30, center.y() - 30, 60, 60)
+        painter.drawEllipse(arc_rect)
+
+        painter.setPen(QtGui.QPen(QtGui.QColor(0, 150, 255), 4))
+        painter.drawArc(arc_rect, self._angle * 16, 90 * 16)
+
+        # Draw text below spinner
+        painter.setPen(QtGui.QColor(255, 255, 255))
+        painter.setFont(QtGui.QFont("Arial", 12))
+        text_rect = QtCore.QRectF(0, center.y() + 50, self.width(), 30)
+        painter.drawText(text_rect, QtCore.Qt.AlignmentFlag.AlignCenter, self._text)
+
+
 class PiezoCapture(QtWidgets.QMainWindow):
     def __init__(self, ip=SCOPE_IP):
         super().__init__()
@@ -403,10 +455,18 @@ class PiezoCapture(QtWidgets.QMainWindow):
 
         layout.addWidget(corr_group)
 
-        # Plot area
+        # Plot area with spinner overlay
+        graphics_container = QtWidgets.QWidget()
+        graphics_layout = QtWidgets.QVBoxLayout(graphics_container)
+        graphics_layout.setContentsMargins(0, 0, 0, 0)
+
         self.graphics = pg.GraphicsLayoutWidget()
         self.graphics.setBackground('#1e1e1e')
-        layout.addWidget(self.graphics)
+        graphics_layout.addWidget(self.graphics)
+
+        self.graphics_container = graphics_container
+        self.spinner = SpinnerOverlay(graphics_container)
+        layout.addWidget(graphics_container)
 
         # CH1 waveform + envelope
         self.plot_ch1 = self.graphics.addPlot(row=0, col=0, title='CH1 Waveform + Envelope')
@@ -446,6 +506,9 @@ class PiezoCapture(QtWidgets.QMainWindow):
         close_shortcut.activated.connect(self.close)
 
     def _connect_scope(self):
+        # Show spinner immediately
+        QtCore.QTimer.singleShot(0, self._show_startup_spinner)
+
         try:
             print(f"Connecting to {self.ip}:{PORT}...")
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -460,16 +523,19 @@ class PiezoCapture(QtWidgets.QMainWindow):
             # Configure scope
             self._configure_scope()
 
-            # Do initial capture to fill plots
-            self._do_initial_capture()
-
-            # Auto-start capture
-            QtCore.QTimer.singleShot(500, self._start_capture)
+            # Do initial capture after window is shown (will start capture when done)
+            QtCore.QTimer.singleShot(100, self._do_initial_capture)
 
         except socket.error as e:
             print(f"Connection failed: {e}")
             self.status_label.setText(f'Connection failed: {e}')
             self.status_label.setStyleSheet('color: red; font-weight: bold;')
+            self.spinner.stop()
+
+    def _show_startup_spinner(self):
+        """Show spinner immediately on startup."""
+        self.spinner.setGeometry(self.graphics_container.rect())
+        self.spinner.start("Loading...")
 
     def _configure_scope(self):
         """Configure scope settings."""
@@ -512,15 +578,28 @@ class PiezoCapture(QtWidgets.QMainWindow):
     def _do_initial_capture(self):
         """Capture current waveform to fill plots on startup."""
         if not self.sock:
+            self._start_capture()
             return
 
         print("Initial capture to fill plots...")
 
-        # Put scope in AUTO, wait for full acquisition cycle, then stop
+        # Clear INR, put in AUTO mode, poll for acquisition complete
+        query(self.sock, 'INR?', timeout=0.1)
         send_command(self.sock, 'TRMD AUTO', wait=False)
-        time.sleep(1.5)  # Wait for full acquisition at 20ms/div * 14 = 280ms, plus margin
+
+        # Poll INR for acquisition complete (bit 0)
+        for _ in range(30):
+            QtWidgets.QApplication.processEvents()
+            try:
+                resp = query(self.sock, 'INR?', timeout=0.1)
+                if resp and int(resp.split()[-1]) & 1:
+                    break
+            except:
+                pass
+            time.sleep(0.05)
+
         send_command(self.sock, 'STOP', wait=False)
-        time.sleep(0.2)
+        time.sleep(0.1)
 
         # Now read waveforms
         upsample = self.upsample_factor if self.interpolate_enabled else 1
@@ -538,6 +617,10 @@ class PiezoCapture(QtWidgets.QMainWindow):
             print("  Initial capture successful")
         else:
             print("  No data - plots will fill on first trigger")
+
+        # Hide spinner and start trigger capture loop
+        self.spinner.stop()
+        self._start_capture()
 
     def _update_correlation_display(self, corr):
         """Update the correlation panel labels."""
