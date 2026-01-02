@@ -85,7 +85,7 @@ def query_binary(sock, cmd, timeout=2):
     return response
 
 
-def get_waveform(sock, channel='C1', vdiv=None):
+def get_waveform(sock, channel='C1', vdiv=None, offset=0.0):
     """Get waveform data from the specified channel."""
     if vdiv is None:
         vdiv_resp = query(sock, f'{channel}:VDIV?')
@@ -93,12 +93,6 @@ def get_waveform(sock, channel='C1', vdiv=None):
             vdiv = float(vdiv_resp.split()[-1].replace('V', ''))
         except:
             vdiv = 1.0
-
-    offset_resp = query(sock, f'{channel}:OFST?')
-    try:
-        offset = float(offset_resp.split()[-1].replace('V', ''))
-    except:
-        offset = 0.0
 
     data_raw = query_binary(sock, f'{channel}:WF? DAT2', timeout=2)
 
@@ -115,6 +109,11 @@ def get_waveform(sock, channel='C1', vdiv=None):
     except (ValueError, IndexError):
         return np.array([]), 0
 
+    # Remove trailing garbage bytes
+    if len(waveform_data) > 2:
+        waveform_data = waveform_data[:-2]
+
+    # Convert bytes to voltage
     values = np.frombuffer(waveform_data, dtype=np.int8)
     voltage = (values.astype(float) * vdiv / 25.0) - offset
 
@@ -123,9 +122,7 @@ def get_waveform(sock, channel='C1', vdiv=None):
 
 def compute_envelope(signal):
     """Compute the envelope of a signal using Hilbert transform."""
-    # Remove DC offset before computing envelope
-    signal_centered = signal - np.mean(signal)
-    analytic_signal = hilbert(signal_centered)
+    analytic_signal = hilbert(signal)
     envelope = np.abs(analytic_signal)
     return envelope
 
@@ -352,18 +349,24 @@ class PiezoCapture(QtWidgets.QMainWindow):
 
     def _connect_scope(self):
         try:
+            print(f"Connecting to {self.ip}:{PORT}...")
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.sock.connect((self.ip, PORT))
             self.sock.settimeout(5)
 
             idn = query(self.sock, '*IDN?')
+            print(f"Connected to: {idn}")
             self.status_label.setText(f'Connected: {idn[:40]}...')
             self.status_label.setStyleSheet('color: green; font-weight: bold;')
 
             # Configure scope
             self._configure_scope()
 
+            # Auto-start capture
+            QtCore.QTimer.singleShot(500, self._start_capture)
+
         except socket.error as e:
+            print(f"Connection failed: {e}")
             self.status_label.setText(f'Connection failed: {e}')
             self.status_label.setStyleSheet('color: red; font-weight: bold;')
 
@@ -371,7 +374,13 @@ class PiezoCapture(QtWidgets.QMainWindow):
         """Configure scope settings."""
         send_command(self.sock, 'SCSV OFF')
 
+        # Set memory depth and waveform transfer for full resolution
+        send_command(self.sock, 'MSIZ 14M')
+        send_command(self.sock, 'WFSU SP,1,NP,0,FP,0')
+        time.sleep(0.2)
+
         # Configure CH1
+        print(f"Setting CH1: {self.ch1_vdiv*1000:.0f}mV/div, centered at 0V")
         send_command(self.sock, 'C1:TRA ON')
         time.sleep(0.1)
         send_command(self.sock, f'C1:VDIV {self.ch1_vdiv}')
@@ -381,6 +390,7 @@ class PiezoCapture(QtWidgets.QMainWindow):
         query(self.sock, 'C1:VDIV?')  # Force processing
 
         # Configure CH2
+        print(f"Setting CH2: {self.ch2_vdiv*1000:.0f}mV/div, centered at 0V")
         send_command(self.sock, 'C2:TRA ON')
         time.sleep(0.1)
         send_command(self.sock, f'C2:VDIV {self.ch2_vdiv}')
@@ -390,26 +400,32 @@ class PiezoCapture(QtWidgets.QMainWindow):
         query(self.sock, 'C2:VDIV?')  # Force processing
 
         # Horizontal
+        print(f"Setting horizontal: {self.hdiv*1000:.0f}ms/div")
         send_command(self.sock, f'TDIV {self.hdiv}')
         time.sleep(0.1)
+        print("Setting horizontal delay: -120ms (left shift)")
         send_command(self.sock, 'TRDL -0.12')
         time.sleep(0.1)
 
         # Trigger
+        print(f"Setting trigger: C1 @ {self.trigger_level}V")
         send_command(self.sock, 'TRSE EDGE,SR,C1,HT,OFF')
         send_command(self.sock, f'C1:TRLV {self.trigger_level}V')
         time.sleep(0.1)
 
         # Verify settings
-        ch1_vdiv = query(self.sock, 'C1:VDIV?')
-        ch2_vdiv = query(self.sock, 'C2:VDIV?')
-        print(f"Configured: CH1={ch1_vdiv}, CH2={ch2_vdiv}")
+        print("\nVerifying settings:")
+        print(f"  CH1 V/div: {query(self.sock, 'C1:VDIV?')}")
+        print(f"  CH2 V/div: {query(self.sock, 'C2:VDIV?')}")
+        print(f"  Time/div: {query(self.sock, 'TDIV?')}")
+        print()
 
     def _arm_trigger(self):
         """Arm the trigger in NORMAL mode."""
         if self.sock:
             send_command(self.sock, 'TRMD NORM')
             query(self.sock, 'INR?')  # Clear INR
+            print("Waiting for trigger...")
             self.status_label.setText('Trigger armed - waiting...')
             self.status_label.setStyleSheet('color: orange; font-weight: bold;')
 
@@ -449,15 +465,19 @@ class PiezoCapture(QtWidgets.QMainWindow):
 
     def _on_trigger(self):
         """Handle trigger event - capture and process."""
+        print("Trigger fired!")
         self.status_label.setText('Capturing...')
         self.status_label.setStyleSheet('color: blue; font-weight: bold;')
         QtWidgets.QApplication.processEvents()
 
         # Capture both channels
+        print("Capturing waveforms...")
         wf1, _ = get_waveform(self.sock, 'C1', self.ch1_vdiv)
         wf2, _ = get_waveform(self.sock, 'C2', self.ch2_vdiv)
+        print(f"  CH1: {len(wf1)} samples, CH2: {len(wf2)} samples")
 
         if len(wf1) == 0 or len(wf2) == 0:
+            print("  No data received, re-arming...")
             self._arm_trigger()
             return
 
@@ -467,6 +487,7 @@ class PiezoCapture(QtWidgets.QMainWindow):
 
         # Analyze correlation
         corr = analyze_correlation(env1, env2, wf1, wf2)
+        print(f"Correlation: {corr['classification']} (score: {corr['correlation_score']:.3f})")
 
         # Update capture count
         self.capture_count += 1
@@ -553,6 +574,8 @@ class PiezoCapture(QtWidgets.QMainWindow):
         # Save correlation
         with open(self.captures_dir / f"corr_{timestamp}.json", 'w') as f:
             json.dump(corr, f, indent=2)
+
+        print(f"Saved capture: {timestamp}")
 
     def _signal_handler(self, signum, frame):
         self.close()

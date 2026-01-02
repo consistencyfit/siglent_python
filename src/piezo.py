@@ -107,7 +107,7 @@ def query_binary(sock, cmd, timeout=2):
     return response
 
 
-def get_waveform(sock, channel='C1', vdiv=None):
+def get_waveform(sock, channel='C1', vdiv=None, offset=0.0):
     """Get waveform data from the specified channel."""
     # Query vdiv if not provided
     if vdiv is None:
@@ -116,13 +116,6 @@ def get_waveform(sock, channel='C1', vdiv=None):
             vdiv = float(vdiv_resp.split()[-1].replace('V', ''))
         except:
             vdiv = 1.0
-
-    # Query offset
-    offset_resp = query(sock, f'{channel}:OFST?')
-    try:
-        offset = float(offset_resp.split()[-1].replace('V', ''))
-    except:
-        offset = 0.0
 
     # Get waveform data
     data_raw = query_binary(sock, f'{channel}:WF? DAT2', timeout=2)
@@ -140,7 +133,11 @@ def get_waveform(sock, channel='C1', vdiv=None):
     except (ValueError, IndexError):
         return np.array([]), 0
 
-    # Convert bytes to voltage: data * vDiv / 25 - offset
+    # Remove trailing garbage bytes
+    if len(waveform_data) > 2:
+        waveform_data = waveform_data[:-2]
+
+    # Convert bytes to voltage
     values = np.frombuffer(waveform_data, dtype=np.int8)
     voltage = (values.astype(float) * vdiv / 25.0) - offset
 
@@ -461,6 +458,11 @@ def main():
 
         # Disable screensaver
         send_command(sock, 'SCSV OFF')
+
+        # Set memory depth and waveform transfer for full resolution
+        send_command(sock, 'MSIZ 14M')
+        send_command(sock, 'WFSU SP,1,NP,0,FP,0')
+        time.sleep(0.2)
 
         # Configure CH1
         print(f"Setting CH1: {args.ch1_vdiv*1000:.0f}mV/div, centered at 0V")
