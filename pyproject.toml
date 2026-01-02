@@ -9,8 +9,9 @@ dependencies = [
 
 [tool.setuptools]
 package-dir = {"" = "src"}
-py-modules = ["capture", "replay"]
+py-modules = ["capture", "replay", "trigger_capture"]
 
 [project.scripts]
 osc_capture = "capture:main"
 osc_replay = "replay:main"
+osc_trigger = "trigger_capture:main"
