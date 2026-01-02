@@ -12,8 +12,12 @@ from pathlib import Path
 
 import numpy as np
 from scipy.signal import hilbert
+from scipy.interpolate import CubicSpline
 import pyqtgraph as pg
 from pyqtgraph.Qt import QtCore, QtWidgets, QtGui
+
+# Enable antialiasing for smoother lines (like matplotlib)
+pg.setConfigOptions(antialias=True)
 
 SCOPE_IP = '192.168.1.142'
 PORT = 5025
@@ -85,8 +89,8 @@ def query_binary(sock, cmd, timeout=2):
     return response
 
 
-def get_waveform(sock, channel='C1', vdiv=None, offset=0.0):
-    """Get waveform data from the specified channel."""
+def get_waveform(sock, channel='C1', vdiv=None, offset=0.0, upsample=4):
+    """Get waveform data from the specified channel with optional upsampling."""
     if vdiv is None:
         vdiv_resp = query(sock, f'{channel}:VDIV?')
         try:
@@ -117,13 +121,26 @@ def get_waveform(sock, channel='C1', vdiv=None, offset=0.0):
     values = np.frombuffer(waveform_data, dtype=np.int8)
     voltage = (values.astype(float) * vdiv / 25.0) - offset
 
+    # Upsample using cubic spline for smooth curves
+    if upsample > 1 and len(voltage) > 10:
+        x_orig = np.arange(len(voltage))
+        x_new = np.linspace(0, len(voltage) - 1, len(voltage) * upsample)
+        cs = CubicSpline(x_orig, voltage)
+        voltage = cs(x_new)
+
     return voltage, vdiv
 
 
-def compute_envelope(signal):
-    """Compute the envelope of a signal using Hilbert transform."""
+def compute_envelope(signal, smooth_window=51):
+    """Compute the envelope of a signal using Hilbert transform with smoothing."""
     analytic_signal = hilbert(signal)
     envelope = np.abs(analytic_signal)
+
+    # Smooth the envelope with a moving average
+    if smooth_window > 1 and len(envelope) > smooth_window:
+        kernel = np.ones(smooth_window) / smooth_window
+        envelope = np.convolve(envelope, kernel, mode='same')
+
     return envelope
 
 
@@ -212,6 +229,13 @@ class PiezoCapture(QtWidgets.QMainWindow):
         self.capture_count = 0
         self.running = False
 
+        # Decimation/interpolation settings
+        self.decimate_enabled = True
+        self.decimate_points = 14000
+        self.interpolate_enabled = True
+        self.upsample_factor = 4
+        self.envelope_smooth = 201  # Larger window for smoother envelope
+
         # Create captures directory
         self.captures_dir = Path('captures')
         self.captures_dir.mkdir(exist_ok=True)
@@ -255,6 +279,48 @@ class PiezoCapture(QtWidgets.QMainWindow):
         self.capture_label = QtWidgets.QLabel('0')
         self.capture_label.setMinimumWidth(50)
         controls.addWidget(self.capture_label)
+
+        controls.addSpacing(20)
+
+        # Decimation controls
+        self.decimate_cb = QtWidgets.QCheckBox('Decimate')
+        self.decimate_cb.setChecked(self.decimate_enabled)
+        self.decimate_cb.toggled.connect(self._on_decimate_changed)
+        controls.addWidget(self.decimate_cb)
+
+        self.decimate_spin = QtWidgets.QSpinBox()
+        self.decimate_spin.setRange(1000, 100000)
+        self.decimate_spin.setSingleStep(1000)
+        self.decimate_spin.setValue(self.decimate_points)
+        self.decimate_spin.setSuffix(' pts')
+        self.decimate_spin.valueChanged.connect(self._on_decimate_changed)
+        controls.addWidget(self.decimate_spin)
+
+        controls.addSpacing(10)
+
+        # Interpolation controls
+        self.interp_cb = QtWidgets.QCheckBox('Interpolate')
+        self.interp_cb.setChecked(self.interpolate_enabled)
+        self.interp_cb.toggled.connect(self._on_interp_changed)
+        controls.addWidget(self.interp_cb)
+
+        self.upsample_spin = QtWidgets.QSpinBox()
+        self.upsample_spin.setRange(1, 8)
+        self.upsample_spin.setValue(self.upsample_factor)
+        self.upsample_spin.setSuffix('x')
+        self.upsample_spin.valueChanged.connect(self._on_interp_changed)
+        controls.addWidget(self.upsample_spin)
+
+        controls.addSpacing(10)
+
+        # Envelope smoothing
+        controls.addWidget(QtWidgets.QLabel('Smooth:'))
+        self.smooth_spin = QtWidgets.QSpinBox()
+        self.smooth_spin.setRange(1, 1001)
+        self.smooth_spin.setSingleStep(50)
+        self.smooth_spin.setValue(self.envelope_smooth)
+        self.smooth_spin.valueChanged.connect(lambda v: setattr(self, 'envelope_smooth', v))
+        controls.addWidget(self.smooth_spin)
 
         controls.addStretch()
 
@@ -374,10 +440,12 @@ class PiezoCapture(QtWidgets.QMainWindow):
         """Configure scope settings."""
         send_command(self.sock, 'SCSV OFF')
 
-        # Set memory depth and waveform transfer for full resolution
+        # Set memory depth
         send_command(self.sock, 'MSIZ 14M')
-        send_command(self.sock, 'WFSU SP,1,NP,0,FP,0')
-        time.sleep(0.2)
+        time.sleep(0.1)
+        # Apply decimation settings
+        self._apply_waveform_settings()
+        time.sleep(0.1)
 
         # Configure CH1
         print(f"Setting CH1: {self.ch1_vdiv*1000:.0f}mV/div, centered at 0V")
@@ -429,6 +497,30 @@ class PiezoCapture(QtWidgets.QMainWindow):
             self.status_label.setText('Trigger armed - waiting...')
             self.status_label.setStyleSheet('color: orange; font-weight: bold;')
 
+    def _on_decimate_changed(self):
+        """Handle decimation settings change."""
+        self.decimate_enabled = self.decimate_cb.isChecked()
+        self.decimate_points = self.decimate_spin.value()
+        self.decimate_spin.setEnabled(self.decimate_enabled)
+        if self.sock:
+            self._apply_waveform_settings()
+
+    def _on_interp_changed(self):
+        """Handle interpolation settings change."""
+        self.interpolate_enabled = self.interp_cb.isChecked()
+        self.upsample_factor = self.upsample_spin.value()
+        self.upsample_spin.setEnabled(self.interpolate_enabled)
+
+    def _apply_waveform_settings(self):
+        """Apply current decimation settings to scope."""
+        if self.decimate_enabled:
+            sparsing = 14000000 // self.decimate_points
+            send_command(self.sock, f'WFSU SP,{sparsing},NP,{self.decimate_points},FP,0')
+            print(f"Decimation: {self.decimate_points} points (SP={sparsing})")
+        else:
+            send_command(self.sock, 'WFSU SP,1,NP,0,FP,0')
+            print("Decimation: OFF (full resolution)")
+
     def _toggle_capture(self):
         if self.running:
             self._stop_capture()
@@ -472,8 +564,9 @@ class PiezoCapture(QtWidgets.QMainWindow):
 
         # Capture both channels
         print("Capturing waveforms...")
-        wf1, _ = get_waveform(self.sock, 'C1', self.ch1_vdiv)
-        wf2, _ = get_waveform(self.sock, 'C2', self.ch2_vdiv)
+        upsample = self.upsample_factor if self.interpolate_enabled else 1
+        wf1, _ = get_waveform(self.sock, 'C1', self.ch1_vdiv, upsample=upsample)
+        wf2, _ = get_waveform(self.sock, 'C2', self.ch2_vdiv, upsample=upsample)
         print(f"  CH1: {len(wf1)} samples, CH2: {len(wf2)} samples")
 
         if len(wf1) == 0 or len(wf2) == 0:
@@ -482,8 +575,8 @@ class PiezoCapture(QtWidgets.QMainWindow):
             return
 
         # Compute envelopes
-        env1 = compute_envelope(wf1)
-        env2 = compute_envelope(wf2)
+        env1 = compute_envelope(wf1, smooth_window=self.envelope_smooth)
+        env2 = compute_envelope(wf2, smooth_window=self.envelope_smooth)
 
         # Analyze correlation
         corr = analyze_correlation(env1, env2, wf1, wf2)

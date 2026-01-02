@@ -14,6 +14,7 @@ from pathlib import Path
 
 import numpy as np
 from scipy.signal import hilbert
+from scipy.interpolate import CubicSpline
 import matplotlib.pyplot as plt
 
 SCOPE_IP = '192.168.1.142'
@@ -107,8 +108,8 @@ def query_binary(sock, cmd, timeout=2):
     return response
 
 
-def get_waveform(sock, channel='C1', vdiv=None, offset=0.0):
-    """Get waveform data from the specified channel."""
+def get_waveform(sock, channel='C1', vdiv=None, offset=0.0, upsample=4):
+    """Get waveform data from the specified channel with optional upsampling."""
     # Query vdiv if not provided
     if vdiv is None:
         vdiv_resp = query(sock, f'{channel}:VDIV?')
@@ -141,13 +142,26 @@ def get_waveform(sock, channel='C1', vdiv=None, offset=0.0):
     values = np.frombuffer(waveform_data, dtype=np.int8)
     voltage = (values.astype(float) * vdiv / 25.0) - offset
 
+    # Upsample using cubic spline for smooth curves
+    if upsample > 1 and len(voltage) > 10:
+        x_orig = np.arange(len(voltage))
+        x_new = np.linspace(0, len(voltage) - 1, len(voltage) * upsample)
+        cs = CubicSpline(x_orig, voltage)
+        voltage = cs(x_new)
+
     return voltage, vdiv
 
 
-def compute_envelope(signal):
-    """Compute the envelope of a signal using Hilbert transform."""
+def compute_envelope(signal, smooth_window=201):
+    """Compute the envelope of a signal using Hilbert transform with smoothing."""
     analytic_signal = hilbert(signal)
     envelope = np.abs(analytic_signal)
+
+    # Smooth the envelope with a moving average
+    if smooth_window > 1 and len(envelope) > smooth_window:
+        kernel = np.ones(smooth_window) / smooth_window
+        envelope = np.convolve(envelope, kernel, mode='same')
+
     return envelope
 
 
@@ -459,9 +473,10 @@ def main():
         # Disable screensaver
         send_command(sock, 'SCSV OFF')
 
-        # Set memory depth and waveform transfer for full resolution
+        # Set memory depth and waveform transfer
         send_command(sock, 'MSIZ 14M')
-        send_command(sock, 'WFSU SP,1,NP,0,FP,0')
+        # Get ~14000 points, then interpolate 4x for smooth display
+        send_command(sock, 'WFSU SP,1000,NP,14000,FP,0')
         time.sleep(0.2)
 
         # Configure CH1
