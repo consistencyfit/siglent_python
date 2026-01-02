@@ -341,9 +341,13 @@ class PiezoCapture(QtWidgets.QMainWindow):
         # Control bar
         controls = QtWidgets.QHBoxLayout()
 
-        self.start_btn = QtWidgets.QPushButton('Start Capture')
-        self.start_btn.clicked.connect(self._toggle_capture)
-        controls.addWidget(self.start_btn)
+        self.arm_btn = QtWidgets.QPushButton('Arm Trigger')
+        self.arm_btn.clicked.connect(self._toggle_trigger)
+        controls.addWidget(self.arm_btn)
+
+        self.capture_btn = QtWidgets.QPushButton('Capture')
+        self.capture_btn.clicked.connect(self._manual_capture)
+        controls.addWidget(self.capture_btn)
 
         controls.addSpacing(20)
 
@@ -578,7 +582,7 @@ class PiezoCapture(QtWidgets.QMainWindow):
     def _do_initial_capture(self):
         """Capture current waveform to fill plots on startup."""
         if not self.sock:
-            self._start_capture()
+            self.spinner.stop()
             return
 
         print("Initial capture to fill plots...")
@@ -618,7 +622,7 @@ class PiezoCapture(QtWidgets.QMainWindow):
         else:
             print("  No data - plots will fill on first trigger")
 
-        # Hide spinner and start trigger capture loop
+        # Hide spinner and arm trigger by default
         self.spinner.stop()
         self._start_capture()
 
@@ -679,24 +683,84 @@ class PiezoCapture(QtWidgets.QMainWindow):
             send_command(self.sock, 'WFSU SP,1,NP,0,FP,0')
             print("Decimation: OFF (full resolution)")
 
-    def _toggle_capture(self):
+    def _toggle_trigger(self):
         if self.running:
-            self._stop_capture()
+            self._disarm_trigger()
         else:
             self._start_capture()
 
     def _start_capture(self):
         self.running = True
-        self.start_btn.setText('Stop Capture')
+        self.arm_btn.setText('Disarm Trigger')
         self._arm_trigger()
         self.poll_timer.start(50)  # Poll every 50ms
 
-    def _stop_capture(self):
+    def _disarm_trigger(self):
         self.running = False
         self.poll_timer.stop()
-        self.start_btn.setText('Start Capture')
-        self.status_label.setText('Stopped')
+        self.arm_btn.setText('Arm Trigger')
+        self.status_label.setText('Disarmed')
         self.status_label.setStyleSheet('color: gray; font-weight: bold;')
+        # Put scope back in AUTO mode
+        if self.sock:
+            send_command(self.sock, 'TRMD AUTO', wait=False)
+
+    def _manual_capture(self):
+        """Take a manual capture without waiting for trigger."""
+        if not self.sock:
+            return
+
+        # Stop polling if running
+        was_running = self.running
+        if was_running:
+            self.poll_timer.stop()
+
+        self.status_label.setText('Capturing...')
+        self.status_label.setStyleSheet('color: blue; font-weight: bold;')
+        QtWidgets.QApplication.processEvents()
+
+        # Put in AUTO mode and wait for acquisition
+        query(self.sock, 'INR?', timeout=0.1)
+        send_command(self.sock, 'TRMD AUTO', wait=False)
+
+        # Poll for acquisition complete
+        for _ in range(30):
+            QtWidgets.QApplication.processEvents()
+            try:
+                resp = query(self.sock, 'INR?', timeout=0.1)
+                if resp and int(resp.split()[-1]) & 1:
+                    break
+            except:
+                pass
+            time.sleep(0.05)
+
+        send_command(self.sock, 'STOP', wait=False)
+        time.sleep(0.1)
+
+        # Capture waveforms
+        upsample = self.upsample_factor if self.interpolate_enabled else 1
+        wf1, _ = get_waveform(self.sock, 'C1', self.ch1_vdiv, upsample=upsample)
+        wf2, _ = get_waveform(self.sock, 'C2', self.ch2_vdiv, upsample=upsample)
+
+        print(f"Manual capture: CH1 {len(wf1)} samples, CH2 {len(wf2)} samples")
+
+        if len(wf1) > 0 and len(wf2) > 0:
+            env1 = compute_envelope(wf1, smooth_window=self.envelope_smooth)
+            env2 = compute_envelope(wf2, smooth_window=self.envelope_smooth)
+            self._update_plots(wf1, env1, wf2, env2)
+            corr = analyze_correlation(env1, env2, wf1, wf2)
+            self._update_correlation_display(corr)
+            self.capture_count += 1
+            self.capture_label.setText(str(self.capture_count))
+            self._save_capture(wf1, env1, wf2, env2, corr)
+
+        # Resume trigger if was running
+        if was_running:
+            self._arm_trigger()
+            self.poll_timer.start(50)
+        else:
+            self.status_label.setText('Disarmed')
+            self.status_label.setStyleSheet('color: gray; font-weight: bold;')
 
     def _poll_trigger(self):
         """Check if trigger has fired."""
