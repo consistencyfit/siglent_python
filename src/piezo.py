@@ -28,6 +28,7 @@ def send_command(sock, cmd, wait=True):
         # Wait for operation complete by querying *OPC?
         # The scope returns "1\n" when the previous command has finished
         sock.sendall(b'*OPC?\n')
+        old_timeout = sock.gettimeout()
         sock.settimeout(5)
         response = b''
         try:
@@ -36,10 +37,13 @@ def send_command(sock, cmd, wait=True):
                 if not chunk:
                     break
                 response += chunk
-                if response.endswith(b'\n'):
+                # Look for "1" response (may have extra whitespace/newlines)
+                if b'1' in response:
                     break
         except socket.timeout:
             pass
+        finally:
+            sock.settimeout(old_timeout)
 
 
 def query(sock, cmd, timeout=2):

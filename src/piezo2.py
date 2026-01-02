@@ -31,6 +31,7 @@ def send_command(sock, cmd, wait=True):
         # Wait for operation complete by querying *OPC?
         # The scope returns "1\n" when the previous command has finished
         sock.sendall(b'*OPC?\n')
+        old_timeout = sock.gettimeout()
         sock.settimeout(5)
         response = b''
         try:
@@ -39,10 +40,13 @@ def send_command(sock, cmd, wait=True):
                 if not chunk:
                     break
                 response += chunk
-                if response.endswith(b'\n'):
+                # Look for "1" response (may have extra whitespace/newlines)
+                if b'1' in response:
                     break
         except socket.timeout:
             pass
+        finally:
+            sock.settimeout(old_timeout)
 
 
 def query(sock, cmd, timeout=2):
@@ -63,7 +67,8 @@ def query(sock, cmd, timeout=2):
     except socket.timeout:
         pass
 
-    return response.decode().strip()
+    # Decode with error handling for any stray binary data
+    return response.decode('utf-8', errors='replace').strip()
 
 
 def query_binary(sock, cmd, timeout=2):
@@ -384,10 +389,18 @@ class PiezoCapture(QtWidgets.QMainWindow):
         corr_grid.addWidget(QtWidgets.QLabel('Amp ratio:'), 2, 4)
         corr_grid.addWidget(self.amp_ratio_label, 2, 5)
 
+        # Spectral centroids
+        self.centroid1_label = QtWidgets.QLabel('--')
+        corr_grid.addWidget(QtWidgets.QLabel('CH1 centroid:'), 3, 0)
+        corr_grid.addWidget(self.centroid1_label, 3, 1)
+
+        self.centroid2_label = QtWidgets.QLabel('--')
+        corr_grid.addWidget(QtWidgets.QLabel('CH2 centroid:'), 3, 2)
+        corr_grid.addWidget(self.centroid2_label, 3, 3)
+
         layout.addWidget(corr_group)
 
         # Plot area
-        pg.setConfigOptions(antialias=False, useOpenGL=True)
         self.graphics = pg.GraphicsLayoutWidget()
         self.graphics.setBackground('#1e1e1e')
         layout.addWidget(self.graphics)
@@ -425,6 +438,10 @@ class PiezoCapture(QtWidgets.QMainWindow):
         self.plot_ch2.setXLink(self.plot_ch1)
         self.plot_fft2.setXLink(self.plot_fft1)
 
+        # Keyboard shortcuts
+        close_shortcut = QtGui.QShortcut(QtGui.QKeySequence('Ctrl+W'), self)
+        close_shortcut.activated.connect(self.close)
+
     def _connect_scope(self):
         try:
             print(f"Connecting to {self.ip}:{PORT}...")
@@ -439,6 +456,9 @@ class PiezoCapture(QtWidgets.QMainWindow):
 
             # Configure scope
             self._configure_scope()
+
+            # Do initial capture to fill plots
+            self._do_initial_capture()
 
             # Auto-start capture
             QtCore.QTimer.singleShot(500, self._start_capture)
@@ -485,6 +505,61 @@ class PiezoCapture(QtWidgets.QMainWindow):
         print(f"  CH2 V/div: {query(self.sock, 'C2:VDIV?')}")
         print(f"  Time/div: {query(self.sock, 'TDIV?')}")
         print()
+
+    def _do_initial_capture(self):
+        """Capture current waveform to fill plots on startup."""
+        if not self.sock:
+            return
+
+        print("Initial capture to fill plots...")
+
+        # Force a single acquisition in AUTO mode
+        send_command(self.sock, 'TRMD AUTO')
+        time.sleep(0.3)  # Let it acquire
+        send_command(self.sock, 'STOP')
+
+        # Capture both channels
+        upsample = self.upsample_factor if self.interpolate_enabled else 1
+        wf1, _ = get_waveform(self.sock, 'C1', self.ch1_vdiv, upsample=upsample)
+        wf2, _ = get_waveform(self.sock, 'C2', self.ch2_vdiv, upsample=upsample)
+
+        if len(wf1) > 0 and len(wf2) > 0:
+            # Compute envelopes
+            env1 = compute_envelope(wf1, smooth_window=self.envelope_smooth)
+            env2 = compute_envelope(wf2, smooth_window=self.envelope_smooth)
+
+            # Update plots
+            self._update_plots(wf1, env1, wf2, env2)
+
+            # Analyze and display correlation
+            corr = analyze_correlation(env1, env2, wf1, wf2)
+            self._update_correlation_display(corr)
+
+            print(f"  CH1: {len(wf1)} samples, CH2: {len(wf2)} samples")
+
+    def _update_correlation_display(self, corr):
+        """Update the correlation panel labels."""
+        score = corr['correlation_score']
+        classification = corr['classification']
+
+        self.corr_score_label.setText(f"{score:.3f}")
+        self.corr_class_label.setText(classification)
+
+        if classification == "CORRELATED":
+            color = 'green'
+        elif classification == "WEAKLY_CORRELATED":
+            color = 'orange'
+        else:
+            color = 'red'
+        self.corr_class_label.setStyleSheet(f'font-size: 18px; font-weight: bold; color: {color};')
+        self.corr_score_label.setStyleSheet(f'font-size: 18px; font-weight: bold; color: {color};')
+
+        self.pearson_env_label.setText(f"{corr['pearson_envelope']:.3f}")
+        self.cosine_sim_label.setText(f"{corr['cosine_similarity']:.3f}")
+        self.ncc_peak_label.setText(f"{corr['ncc_peak']:.1f}")
+        self.ncc_lag_label.setText(f"{corr['ncc_lag_samples']} samples")
+        self.peak_lag_label.setText(f"{corr['peak_lag_samples']} samples")
+        self.amp_ratio_label.setText(f"{corr['amplitude_ratio']:.3f}")
 
     def _arm_trigger(self):
         """Arm the trigger in NORMAL mode."""
@@ -585,28 +660,7 @@ class PiezoCapture(QtWidgets.QMainWindow):
         self.capture_label.setText(str(self.capture_count))
 
         # Update correlation display
-        score = corr['correlation_score']
-        classification = corr['classification']
-
-        self.corr_score_label.setText(f"{score:.3f}")
-        self.corr_class_label.setText(classification)
-
-        if classification == "CORRELATED":
-            color = 'green'
-        elif classification == "WEAKLY_CORRELATED":
-            color = 'orange'
-        else:
-            color = 'red'
-        self.corr_class_label.setStyleSheet(f'font-size: 18px; font-weight: bold; color: {color};')
-        self.corr_score_label.setStyleSheet(f'font-size: 18px; font-weight: bold; color: {color};')
-
-        # Update all correlation parameters
-        self.pearson_env_label.setText(f"{corr['pearson_envelope']:.3f}")
-        self.cosine_sim_label.setText(f"{corr['cosine_similarity']:.3f}")
-        self.ncc_peak_label.setText(f"{corr['ncc_peak']:.1f}")
-        self.ncc_lag_label.setText(f"{corr['ncc_lag_samples']} samples")
-        self.peak_lag_label.setText(f"{corr['peak_lag_samples']} samples")
-        self.amp_ratio_label.setText(f"{corr['amplitude_ratio']:.3f}")
+        self._update_correlation_display(corr)
 
         # Update plots
         self._update_plots(wf1, env1, wf2, env2)
@@ -635,8 +689,9 @@ class PiezoCapture(QtWidgets.QMainWindow):
         self.curve_ch2_env_upper.setData(time_axis2[:len(env2)], env2 * 1000)
         self.curve_ch2_env_lower.setData(time_axis2[:len(env2)], -env2 * 1000)
 
-        # FFT
+        # FFT and spectral centroids
         sample_rate = len(wf1) / (self.hdiv * 14)
+        centroids = []
 
         for wf, curve in [(wf1, self.curve_fft1), (wf2, self.curve_fft2)]:
             n = len(wf)
@@ -645,6 +700,18 @@ class PiezoCapture(QtWidgets.QMainWindow):
             freqs = np.fft.fftfreq(n, 1/sample_rate)[:n//2]
             fft_db = 20 * np.log10(fft_mag + 1e-10)
             curve.setData(freqs, fft_db)
+
+            # Compute spectral centroid: sum(freq * mag) / sum(mag)
+            mag_sum = np.sum(fft_mag)
+            if mag_sum > 0:
+                centroid = np.sum(freqs * fft_mag) / mag_sum
+            else:
+                centroid = 0
+            centroids.append(centroid)
+
+        # Update centroid labels
+        self.centroid1_label.setText(f"{centroids[0]:.1f} Hz")
+        self.centroid2_label.setText(f"{centroids[1]:.1f} Hz")
 
         # Set FFT x limit
         self.plot_fft1.setXRange(0, min(sample_rate/2, 5000))
@@ -698,7 +765,7 @@ def main():
 
     app = QtWidgets.QApplication(sys.argv)
     window = PiezoCapture(ip=args.ip)
-    window.show()
+    window.showMaximized()
     sys.exit(app.exec())
 
 
