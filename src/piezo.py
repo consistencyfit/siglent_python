@@ -107,7 +107,7 @@ def query_binary(sock, cmd, timeout=2):
     return response
 
 
-def get_waveform(sock, channel='C1', vdiv=None, offset=0.0):
+def get_waveform(sock, channel='C1', vdiv=None):
     """Get waveform data from the specified channel."""
     # Query vdiv if not provided
     if vdiv is None:
@@ -116,6 +116,13 @@ def get_waveform(sock, channel='C1', vdiv=None, offset=0.0):
             vdiv = float(vdiv_resp.split()[-1].replace('V', ''))
         except:
             vdiv = 1.0
+
+    # Query offset
+    offset_resp = query(sock, f'{channel}:OFST?')
+    try:
+        offset = float(offset_resp.split()[-1].replace('V', ''))
+    except:
+        offset = 0.0
 
     # Get waveform data
     data_raw = query_binary(sock, f'{channel}:WF? DAT2', timeout=2)
@@ -133,7 +140,7 @@ def get_waveform(sock, channel='C1', vdiv=None, offset=0.0):
     except (ValueError, IndexError):
         return np.array([]), 0
 
-    # Convert bytes to voltage
+    # Convert bytes to voltage: data * vDiv / 25 - offset
     values = np.frombuffer(waveform_data, dtype=np.int8)
     voltage = (values.astype(float) * vdiv / 25.0) - offset
 
@@ -301,6 +308,52 @@ def plot_waveform_with_envelope(waveform, envelope, tdiv, channel='C1', save_pat
     if save_path:
         plt.savefig(save_path, dpi=150, facecolor=fig.get_facecolor())
         print(f"Saved plot to: {save_path}")
+
+    plt.show()
+
+
+def plot_fft(wf1, wf2, tdiv, save_path=None):
+    """Plot FFT of both channels."""
+    # Calculate sample rate from tdiv (14 divisions on screen)
+    total_time = tdiv * 14
+    sample_rate = len(wf1) / total_time
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+
+    for ax, wf, color, label in [(ax1, wf1, 'y', 'CH1'), (ax2, wf2, 'c', 'CH2')]:
+        n = len(wf)
+        # Compute FFT
+        fft_vals = np.fft.fft(wf)
+        fft_mag = np.abs(fft_vals[:n//2]) * 2 / n  # Single-sided, normalized
+        freqs = np.fft.fftfreq(n, 1/sample_rate)[:n//2]
+
+        # Convert to dB (with floor to avoid log(0))
+        fft_db = 20 * np.log10(fft_mag + 1e-10)
+
+        ax.plot(freqs, fft_db, color=color, linewidth=0.8, label=f'{label} FFT')
+        ax.set_ylabel('Magnitude (dB)')
+        ax.set_title(f'{label} Frequency Spectrum')
+        ax.legend(loc='upper right')
+        ax.grid(True, alpha=0.3)
+        ax.set_facecolor('black')
+        ax.set_xlim(0, min(sample_rate/2, 5000))  # Limit to 5kHz or Nyquist
+
+    ax2.set_xlabel('Frequency (Hz)')
+
+    fig.patch.set_facecolor('#2b2b2b')
+    for ax in (ax1, ax2):
+        ax.tick_params(colors='white')
+        ax.xaxis.label.set_color('white')
+        ax.yaxis.label.set_color('white')
+        ax.title.set_color('white')
+        for spine in ax.spines.values():
+            spine.set_color('white')
+
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path, dpi=150, facecolor=fig.get_facecolor())
+        print(f"Saved FFT plot to: {save_path}")
 
     plt.show()
 
@@ -529,6 +582,10 @@ def main():
                 # Plot both channels with envelopes
                 plot_path = captures_dir / f"plot_{timestamp}.png"
                 plot_dual_channel_envelopes(wf1, env1, wf2, env2, args.hdiv, save_path=plot_path)
+
+                # Plot FFT
+                fft_path = captures_dir / f"fft_{timestamp}.png"
+                plot_fft(wf1, wf2, args.hdiv, save_path=fft_path)
             else:
                 print("Error: No waveform data received")
 
