@@ -110,7 +110,7 @@ def query_binary(sock, cmd, timeout=2):
     return response
 
 
-def get_waveform(sock, channel='C1', vdiv=None, offset=0.0, upsample=4):
+def get_waveform(sock, channel='C1', vdiv=None, offset=0.0, upsample=4, debug=False):
     """Get waveform data from the specified channel with optional upsampling."""
     if vdiv is None:
         vdiv_resp = query(sock, f'{channel}:VDIV?')
@@ -120,6 +120,9 @@ def get_waveform(sock, channel='C1', vdiv=None, offset=0.0, upsample=4):
             vdiv = 1.0
 
     data_raw = query_binary(sock, f'{channel}:WF? DAT2', timeout=2)
+
+    if debug:
+        print(f"  DEBUG {channel}: got {len(data_raw)} bytes, starts with: {data_raw[:50] if data_raw else 'empty'}")
 
     if b'#' not in data_raw:
         return np.array([]), 0
@@ -508,34 +511,8 @@ class PiezoCapture(QtWidgets.QMainWindow):
 
     def _do_initial_capture(self):
         """Capture current waveform to fill plots on startup."""
-        if not self.sock:
-            return
-
-        print("Initial capture to fill plots...")
-
-        # Force a single acquisition in AUTO mode
-        send_command(self.sock, 'TRMD AUTO')
-        time.sleep(0.3)  # Let it acquire
-        send_command(self.sock, 'STOP')
-
-        # Capture both channels
-        upsample = self.upsample_factor if self.interpolate_enabled else 1
-        wf1, _ = get_waveform(self.sock, 'C1', self.ch1_vdiv, upsample=upsample)
-        wf2, _ = get_waveform(self.sock, 'C2', self.ch2_vdiv, upsample=upsample)
-
-        if len(wf1) > 0 and len(wf2) > 0:
-            # Compute envelopes
-            env1 = compute_envelope(wf1, smooth_window=self.envelope_smooth)
-            env2 = compute_envelope(wf2, smooth_window=self.envelope_smooth)
-
-            # Update plots
-            self._update_plots(wf1, env1, wf2, env2)
-
-            # Analyze and display correlation
-            corr = analyze_correlation(env1, env2, wf1, wf2)
-            self._update_correlation_display(corr)
-
-            print(f"  CH1: {len(wf1)} samples, CH2: {len(wf2)} samples")
+        # Skip - plots will fill on first trigger
+        pass
 
     def _update_correlation_display(self, corr):
         """Update the correlation panel labels."""
@@ -750,7 +727,6 @@ class PiezoCapture(QtWidgets.QMainWindow):
         self.poll_timer.stop()
         if self.sock:
             try:
-                send_command(self.sock, 'TRMD AUTO')
                 self.sock.close()
             except:
                 pass
