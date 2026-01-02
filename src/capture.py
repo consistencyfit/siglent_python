@@ -37,18 +37,21 @@ def query(sock, cmd, timeout=2, delay=0.05):
 
     response = b''
     expected_length = None
+    start_time = time.time()
 
     try:
         while True:
+            # Check if we've exceeded timeout
+            if time.time() - start_time > timeout:
+                break
+
             chunk = sock.recv(65536)
             if not chunk:
                 break
             response += chunk
 
             # Look for IEEE 488.2 header near the START of response (within first 50 bytes)
-            # The response format is: "C1:WF DAT2,#9000001400<binary_data>\n"
             if expected_length is None:
-                # Find '#' only in the header portion (first 50 bytes)
                 header_portion = response[:50]
                 if b'#' in header_portion:
                     hash_pos = response.find(b'#')
@@ -58,7 +61,6 @@ def query(sock, cmd, timeout=2, delay=0.05):
                             if num_digits > 0 and len(response) > hash_pos + 2 + num_digits:
                                 length_str = response[hash_pos + 2:hash_pos + 2 + num_digits]
                                 data_length = int(length_str)
-                                # Total: everything up to data + data + trailing newlines
                                 expected_length = hash_pos + 2 + num_digits + data_length + 2
                                 log.debug(f"Expecting {expected_length} total bytes ({data_length} data bytes)")
                         except (ValueError, IndexError):
@@ -68,12 +70,20 @@ def query(sock, cmd, timeout=2, delay=0.05):
             if expected_length and len(response) >= expected_length:
                 break
 
-            # Fallback: if chunk is small and we have some data, assume done
-            if len(chunk) < 65536 and len(response) > 100:
-                break
-
     except socket.timeout:
-        log.debug(f"Query timeout after receiving {len(response)} bytes")
+        # Keep trying if we know we need more data
+        if expected_length and len(response) < expected_length:
+            remaining = expected_length - len(response)
+            log.debug(f"Timeout but need {remaining} more bytes, retrying...")
+            try:
+                sock.settimeout(0.5)  # Shorter timeout for retry
+                while len(response) < expected_length:
+                    chunk = sock.recv(min(65536, expected_length - len(response)))
+                    if not chunk:
+                        break
+                    response += chunk
+            except socket.timeout:
+                pass
 
     return response
 
