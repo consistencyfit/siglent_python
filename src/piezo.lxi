@@ -1,0 +1,18 @@
+-- Piezo capture setup for Siglent oscilloscope
+
+scope = lxi_connect("192.168.1.142", 5025, "scope", 2000, "VXI11")
+
+lxi_scpi(scope, "SCSV OFF", 1000)
+lxi_scpi(scope, "C1:TRA ON", 1000)
+lxi_scpi(scope, "C1:VDIV 0.07", 1000)
+lxi_scpi(scope, "C1:OFST 0", 1000)
+lxi_scpi(scope, "C2:TRA ON", 1000)
+lxi_scpi(scope, "C2:VDIV 0.07", 1000)
+lxi_scpi(scope, "C2:OFST 0", 1000)
+lxi_scpi(scope, "TDIV 0.02", 1000)
+lxi_scpi(scope, "TRDL -0.12", 1000)
+lxi_scpi(scope, "TRSE EDGE,SR,C1,HT,OFF", 1000)
+lxi_scpi(scope, "C1:TRLV 0.005V", 1000)
+lxi_scpi(scope, "TRMD NORM", 1000)
+
+lxi_disconnect(scope)

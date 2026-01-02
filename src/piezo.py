@@ -91,7 +91,7 @@ def wait_for_trigger(sock, timeout=30):
 def main():
     parser = argparse.ArgumentParser(description='Configure scope and capture on trigger')
     parser.add_argument('--ip', default=SCOPE_IP, help=f'Scope IP address (default: {SCOPE_IP})')
-    parser.add_argument('--trigger-level', type=float, default=0.02, help='Trigger level in volts (default: 0.02 = 20mV)')
+    parser.add_argument('--trigger-level', type=float, default=0.005, help='Trigger level in volts (default: 0.005 = 5mV)')
     parser.add_argument('--trigger-source', default='C1', help='Trigger source channel (default: C1)')
     parser.add_argument('--hdiv', type=float, default=0.02, help='Horizontal time/div in seconds (default: 0.02 = 20ms)')
     parser.add_argument('--ch1-vdiv', type=float, default=0.07, help='CH1 voltage/div in volts (default: 0.07 = 70mV)')
