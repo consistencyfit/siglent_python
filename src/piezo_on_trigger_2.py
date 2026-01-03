@@ -442,16 +442,17 @@ class WaveletViewer(QtWidgets.QDialog):
         info.setStyleSheet('font-size: 13px; padding: 5px;')
         layout.addWidget(info)
 
-        # Graphics widget with fixed height - no scroll area, just the widget
-        graphics = pg.GraphicsLayoutWidget()
-        graphics.setBackground('#1e1e1e')
-        graphics.setMinimumHeight(num_rows * plot_height)
+        # Use QScrollArea with a container widget for the plots
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
 
-        # Critical performance settings
-        graphics.setViewportUpdateMode(QtWidgets.QGraphicsView.ViewportUpdateMode.BoundingRectViewportUpdate)
-        graphics.setCacheMode(QtWidgets.QGraphicsView.CacheModeFlag.CacheBackground)
-        graphics.setOptimizationFlag(QtWidgets.QGraphicsView.OptimizationFlag.DontAdjustForAntialiasing, True)
-        graphics.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing, False)
+        # Container widget with grid layout for plot widgets
+        container = QtWidgets.QWidget()
+        grid = QtWidgets.QGridLayout(container)
+        grid.setSpacing(5)
+        grid.setContentsMargins(5, 5, 5, 5)
 
         # Shared pens
         pen_real = pg.mkPen('c', width=1.5)
@@ -461,20 +462,15 @@ class WaveletViewer(QtWidgets.QDialog):
         max_pts = 200
         row, col = 0, 0
         for freq, t_ms, real, imag in wavelets:
-            plot = graphics.addPlot(row=row, col=col, title=f'{freq:.1f} Hz')
-            plot.hideAxis('bottom')
-            plot.hideAxis('left')
-            plot.setMouseEnabled(x=False, y=False)
-            plot.setMenuEnabled(False)
-            plot.hideButtons()
-
-            vb = plot.getViewBox()
-            vb.setMouseEnabled(x=False, y=False)
-            vb.disableAutoRange()
-            vb.setDefaultPadding(0)
-
-            # Cache the plot item
-            plot.setCacheMode(QtWidgets.QGraphicsItem.CacheMode.DeviceCoordinateCache)
+            # Create individual PlotWidget with fixed minimum size
+            pw = pg.PlotWidget(background='#1e1e1e', title=f'{freq:.1f} Hz')
+            pw.setMinimumSize(300, plot_height)
+            pw.hideAxis('bottom')
+            pw.hideAxis('left')
+            pw.setMouseEnabled(x=False, y=False)
+            pw.setMenuEnabled(False)
+            pw.hideButtons()
+            pw.getPlotItem().getViewBox().setMouseEnabled(x=False, y=False)
 
             # Downsample
             if len(t_ms) > max_pts:
@@ -485,31 +481,24 @@ class WaveletViewer(QtWidgets.QDialog):
 
             envelope = np.sqrt(real**2 + imag**2)
 
-            # Plot curves
-            c1 = plot.plot(t_ms, real, pen=pen_real)
-            c2 = plot.plot(t_ms, imag, pen=pen_imag)
-            c3 = plot.plot(t_ms, envelope, pen=pen_env)
-            c4 = plot.plot(t_ms, -envelope, pen=pen_env)
-
-            # Cache curves
-            for c in [c1, c2, c3, c4]:
-                c.setCacheMode(QtWidgets.QGraphicsItem.CacheMode.DeviceCoordinateCache)
+            pw.plot(t_ms, real, pen=pen_real)
+            pw.plot(t_ms, imag, pen=pen_imag)
+            pw.plot(t_ms, envelope, pen=pen_env)
+            pw.plot(t_ms, -envelope, pen=pen_env)
 
             # Set fixed range
-            plot.setXRange(t_ms[0], t_ms[-1], padding=0.02)
+            pw.setXRange(t_ms[0], t_ms[-1], padding=0.02)
             y_max = max(np.max(np.abs(real)), np.max(envelope)) * 1.1
-            plot.setYRange(-y_max, y_max, padding=0)
+            pw.setYRange(-y_max, y_max, padding=0)
+
+            grid.addWidget(pw, row, col)
 
             col += 1
             if col >= cols:
                 col = 0
                 row += 1
 
-        # Put in scroll area
-        scroll = QtWidgets.QScrollArea()
-        scroll.setWidget(graphics)
-        scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setWidget(container)
         layout.addWidget(scroll)
 
         # Close button
@@ -581,7 +570,7 @@ class PiezoCapture(QtWidgets.QMainWindow):
         self.ch1_vdiv = 0.07
         self.ch2_vdiv = 0.07
         self.hdiv = 0.02
-        self.trigger_level = 0.0025
+        self.trigger_level = 0.0050
         self.capture_count = 0
         self.running = False
 
@@ -709,6 +698,17 @@ class PiezoCapture(QtWidgets.QMainWindow):
         self.onset_markers_cb.setChecked(False)
         self.onset_markers_cb.stateChanged.connect(self._on_onset_markers_changed)
         controls.addWidget(self.onset_markers_cb)
+
+        controls.addSpacing(10)
+
+        # Number of wavelets control
+        controls.addWidget(QtWidgets.QLabel('Wavelets:'))
+        self.num_wavelets_spin = QtWidgets.QSpinBox()
+        self.num_wavelets_spin.setRange(10, 100)
+        self.num_wavelets_spin.setSingleStep(5)
+        self.num_wavelets_spin.setValue(40)
+        self.num_wavelets_spin.setToolTip('Number of frequency bins for CWT analysis')
+        controls.addWidget(self.num_wavelets_spin)
 
         controls.addStretch()
 
@@ -1286,8 +1286,9 @@ class PiezoCapture(QtWidgets.QMainWindow):
         print(f"CWT: {len(wf1)} -> {len(wf1_ds)} samples (ds={ds_factor}), sample_rate={sample_rate_ds:.0f} Hz")
 
         # Compute CWT correlation (store wavelets for visualization)
+        num_freqs = self.num_wavelets_spin.value()
         cwt_result = cwt_correlation(wf1_ds, wf2_ds, sample_rate_ds,
-                                     freq_min=10, freq_max=1000, num_freqs=40,
+                                     freq_min=10, freq_max=1000, num_freqs=num_freqs,
                                      store_wavelets=True)
         self.current_wavelets = cwt_result['wavelets']
 
