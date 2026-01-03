@@ -762,9 +762,12 @@ class PiezoCapture(QtWidgets.QMainWindow):
             self.capture_label.setText(str(self.capture_count))
             self._save_capture(wf1, env1, wf2, env2, corr)
 
-        # Resume trigger if was running
+        # Resume trigger mode (NORMAL) whether was running or not
+        self.sock.sendall(b'TRMD NORM\n')
+        time.sleep(0.05)
+
         if was_running:
-            self._arm_trigger()
+            self._arm_trigger()  # Just clear INR since we just set NORM
             self.poll_timer.start(50)
         else:
             self.status_label.setText('Disarmed')
