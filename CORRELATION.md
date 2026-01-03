@@ -85,7 +85,32 @@ cos_sim = (env1_norm · env2_norm) / (||env1_norm|| × ||env2_norm||)
 
 ---
 
-### 5. Peak Lag (`peak_lag_samples`)
+### 5. Onset Lag (`onset_lag_samples`) ⭐ PRIMARY TIMING METRIC
+
+**What it measures**: Time difference between when each signal first rises above 10% of its peak value.
+
+**Formula**:
+```
+onset1 = first index where env1 > 0.1 × max(env1)
+onset2 = first index where env2 > 0.1 × max(env2)
+onset_lag = onset1 - onset2
+```
+
+**Range**: Negative to positive (samples)
+- Negative = CH1 onset before CH2
+- Positive = CH2 onset before CH1
+- Zero = Simultaneous onset
+
+**Interpretation**: This is the most important timing metric for impact detection. When the same impact event is detected by both sensors, they should start responding at nearly the same time. The onset is more reliable than peak timing because:
+- Peaks can be affected by resonance and ringing
+- Onset captures the initial wavefront arrival
+- Less sensitive to differences in sensor frequency response
+
+**Weight in score**: 40% (highest weight)
+
+---
+
+### 6. Peak Lag (`peak_lag_samples`)
 
 **What it measures**: Time difference between envelope peaks.
 
@@ -96,11 +121,11 @@ peak_lag = argmax(env1) - argmax(env2)
 
 **Range**: Negative to positive (samples)
 
-**Interpretation**: Simple measure of timing alignment. If both sensors respond to the same event, their peaks should occur at similar times. Large values indicate different events or significant propagation delay.
+**Interpretation**: Secondary timing measure. Peaks may differ more than onsets due to resonance effects.
 
 ---
 
-### 6. Amplitude Ratio (`amplitude_ratio`)
+### 7. Amplitude Ratio (`amplitude_ratio`)
 
 **What it measures**: Ratio of peak amplitudes between the two envelopes.
 
@@ -125,17 +150,20 @@ ratio = min(peak1, peak2) / max(peak1, peak2)
 
 **Formula**:
 ```
-score = 0.35 × pearson_env
-      + 0.30 × cosine_sim
-      + 0.20 × amplitude_ratio
-      + 0.15 × (1 - min(|peak_lag|, 100) / 100)
+onset_score = 1 - min(|onset_lag|, 100) / 100
+score = 0.40 × onset_score
+      + 0.25 × pearson_env
+      + 0.20 × cosine_sim
+      + 0.15 × amplitude_ratio
 ```
 
+**Peak Significance Check**: Before classification, both channels must have a significant peak (peak amplitude > 3× mean envelope). If either channel lacks a significant peak, the classification is `NO_PEAK`.
+
 **Weights explained**:
-- **Pearson (35%)**: Primary shape/timing correlation
-- **Cosine (30%)**: Shape similarity
-- **Amplitude (20%)**: Response magnitude similarity
-- **Timing (15%)**: Peak alignment penalty (penalizes lags > 100 samples)
+- **Onset Timing (40%)**: Most important - measures if signals start at the same time (penalizes lags > 100 samples)
+- **Pearson (25%)**: Shape/timing correlation
+- **Cosine (20%)**: Shape similarity
+- **Amplitude (15%)**: Response magnitude similarity
 
 **Range**: Approximately 0 to 1
 
@@ -143,13 +171,16 @@ score = 0.35 × pearson_env
 
 ## Classification
 
-Based on the correlation score:
+Based on peak significance and correlation score:
 
-| Score Range | Classification | Meaning |
-|-------------|----------------|---------|
-| > 0.7 | `CORRELATED` | Signals are likely from the same event |
-| 0.4 - 0.7 | `WEAKLY_CORRELATED` | Some similarity, possibly related |
-| < 0.4 | `UNCORRELATED` | Signals appear independent |
+| Condition | Classification | Meaning |
+|-----------|----------------|---------|
+| No significant peak | `NO_PEAK` | One or both channels lack a detectable event |
+| Score > 0.7 | `CORRELATED` | Signals are likely from the same event |
+| Score 0.4 - 0.7 | `WEAKLY_CORRELATED` | Some similarity, possibly related |
+| Score < 0.4 | `UNCORRELATED` | Signals appear independent |
+
+A **significant peak** is defined as peak amplitude > 3× the mean envelope value.
 
 ---
 

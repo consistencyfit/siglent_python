@@ -178,11 +178,23 @@ def fft_correlate(a, b):
     return corr[:n]
 
 
-def analyze_correlation(env1, env2, wf1, wf2):
-    """Analyze correlation between two channels."""
+def find_onset(env, threshold_pct=0.1):
+    """Find onset index where envelope rises above threshold before the peak."""
+    peak_idx = np.argmax(env)
+    peak_val = env[peak_idx]
+    threshold = peak_val * threshold_pct
+
+    # Look backwards from peak to find where signal drops below threshold
+    for i in range(peak_idx, -1, -1):
+        if env[i] < threshold:
+            return i + 1  # Return the index just after it crosses threshold
+    return 0
+
+
+def analyze_correlation(env1, env2):
+    """Analyze correlation between two envelope signals."""
     min_len = min(len(env1), len(env2))
     env1, env2 = env1[:min_len], env2[:min_len]
-    wf1, wf2 = wf1[:min_len], wf2[:min_len]
 
     max_samples = 10000
     if min_len > max_samples:
@@ -206,20 +218,38 @@ def analyze_correlation(env1, env2, wf1, wf2):
     peak2_idx = np.argmax(env2)
     peak_lag_samples = peak1_idx - peak2_idx
 
+    # Onset detection - when signal first rises above 10% of peak
+    onset1_idx = find_onset(env1, threshold_pct=0.1)
+    onset2_idx = find_onset(env2, threshold_pct=0.1)
+    onset_lag_samples = onset1_idx - onset2_idx
+
     peak1_amp = np.max(env1)
     peak2_amp = np.max(env2)
     amplitude_ratio = min(peak1_amp, peak2_amp) / (max(peak1_amp, peak2_amp) + 1e-10)
 
     cosine_sim = np.dot(env1_norm, env2_norm) / (np.linalg.norm(env1_norm) * np.linalg.norm(env2_norm) + 1e-10)
 
+    # Check for significant peaks (peak must be at least 1.5x the mean envelope)
+    # This filters out noise-only signals
+    peak1_significant = peak1_amp > 1.5 * np.mean(env1)
+    peak2_significant = peak2_amp > 1.5 * np.mean(env2)
+    both_significant = peak1_significant and peak2_significant
+
+    # Timing score based on onset lag (more important than peak lag)
+    # More lax threshold: 100 samples before score drops to 0
+    onset_score = 1 - min(abs(onset_lag_samples), 100) / 100
+
     correlation_score = (
-        0.35 * pearson_env +
-        0.30 * cosine_sim +
-        0.20 * amplitude_ratio +
-        0.15 * (1 - min(abs(peak_lag_samples), 100) / 100)
+        0.25 * pearson_env +
+        0.20 * cosine_sim +
+        0.15 * amplitude_ratio +
+        0.40 * onset_score  # Onset timing is now the most important factor
     )
 
-    if correlation_score > 0.7:
+    # Classification requires both channels to have significant peaks
+    if not both_significant:
+        classification = "NO_PEAK"
+    elif correlation_score > 0.7:
         classification = "CORRELATED"
     elif correlation_score > 0.4:
         classification = "WEAKLY_CORRELATED"
@@ -231,6 +261,9 @@ def analyze_correlation(env1, env2, wf1, wf2):
         'ncc_peak': float(ncc_peak),
         'ncc_lag_samples': int(ncc_lag),
         'peak_lag_samples': int(peak_lag_samples),
+        'onset_lag_samples': int(onset_lag_samples),
+        'onset1_idx': int(onset1_idx),
+        'onset2_idx': int(onset2_idx),
         'amplitude_ratio': float(amplitude_ratio),
         'cosine_similarity': float(cosine_sim),
         'correlation_score': float(correlation_score),
@@ -311,6 +344,9 @@ class PiezoCapture(QtWidgets.QMainWindow):
         self.interpolate_enabled = True
         self.upsample_factor = 4
         self.envelope_smooth = 201  # Larger window for smoother envelope
+        self.trigger_delay_ms = -120  # Horizontal trigger delay in ms
+        self.show_onset_markers = False
+        self.current_time_array = None  # Store time array for onset marker positioning
 
         # Create captures directory
         self.captures_dir = Path('captures')
@@ -345,7 +381,7 @@ class PiezoCapture(QtWidgets.QMainWindow):
         self.arm_btn.clicked.connect(self._toggle_trigger)
         controls.addWidget(self.arm_btn)
 
-        self.capture_btn = QtWidgets.QPushButton('ManualCapture')
+        self.capture_btn = QtWidgets.QPushButton('Manual Capture')
         self.capture_btn.clicked.connect(self._manual_capture)
         controls.addWidget(self.capture_btn)
 
@@ -398,6 +434,24 @@ class PiezoCapture(QtWidgets.QMainWindow):
         self.smooth_spin.valueChanged.connect(lambda v: setattr(self, 'envelope_smooth', v))
         controls.addWidget(self.smooth_spin)
 
+        # Trigger delay control
+        controls.addWidget(QtWidgets.QLabel('Delay:'))
+        self.delay_spin = QtWidgets.QSpinBox()
+        self.delay_spin.setRange(-500, 500)
+        self.delay_spin.setSingleStep(10)
+        self.delay_spin.setValue(self.trigger_delay_ms)
+        self.delay_spin.setSuffix(' ms')
+        self.delay_spin.valueChanged.connect(self._on_delay_changed)
+        controls.addWidget(self.delay_spin)
+
+        controls.addSpacing(10)
+
+        # Onset markers toggle
+        self.onset_markers_cb = QtWidgets.QCheckBox('Onset')
+        self.onset_markers_cb.setChecked(False)
+        self.onset_markers_cb.stateChanged.connect(self._on_onset_markers_changed)
+        controls.addWidget(self.onset_markers_cb)
+
         controls.addStretch()
 
         # Status label
@@ -440,13 +494,17 @@ class PiezoCapture(QtWidgets.QMainWindow):
         corr_grid.addWidget(QtWidgets.QLabel('NCC lag:'), 2, 0)
         corr_grid.addWidget(self.ncc_lag_label, 2, 1)
 
-        self.peak_lag_label = QtWidgets.QLabel('--')
-        corr_grid.addWidget(QtWidgets.QLabel('Peak lag:'), 2, 2)
-        corr_grid.addWidget(self.peak_lag_label, 2, 3)
+        self.onset_lag_label = QtWidgets.QLabel('--')
+        corr_grid.addWidget(QtWidgets.QLabel('Onset lag:'), 2, 2)
+        corr_grid.addWidget(self.onset_lag_label, 2, 3)
 
         self.amp_ratio_label = QtWidgets.QLabel('--')
         corr_grid.addWidget(QtWidgets.QLabel('Amp ratio:'), 2, 4)
         corr_grid.addWidget(self.amp_ratio_label, 2, 5)
+
+        self.peak_lag_label = QtWidgets.QLabel('--')
+        corr_grid.addWidget(QtWidgets.QLabel('Peak lag:'), 3, 4)
+        corr_grid.addWidget(self.peak_lag_label, 3, 5)
 
         # Spectral centroids
         self.centroid1_label = QtWidgets.QLabel('--')
@@ -479,6 +537,9 @@ class PiezoCapture(QtWidgets.QMainWindow):
         self.curve_ch1 = self.plot_ch1.plot(pen=pg.mkPen(color=(255, 255, 0, 180), width=0.5))
         self.curve_ch1_env_upper = self.plot_ch1.plot(pen=pg.mkPen('r', width=1.5))
         self.curve_ch1_env_lower = self.plot_ch1.plot(pen=pg.mkPen('r', width=1.5))
+        self.onset_marker_ch1 = pg.InfiniteLine(pos=0, angle=90, pen=pg.mkPen(color=(0, 255, 0), width=3))
+        self.onset_marker_ch1.setVisible(False)
+        self.plot_ch1.addItem(self.onset_marker_ch1)
 
         # CH2 waveform + envelope
         self.plot_ch2 = self.graphics.addPlot(row=1, col=0, title='CH2 Waveform + Envelope')
@@ -488,6 +549,9 @@ class PiezoCapture(QtWidgets.QMainWindow):
         self.curve_ch2 = self.plot_ch2.plot(pen=pg.mkPen(color=(0, 255, 255, 180), width=0.5))
         self.curve_ch2_env_upper = self.plot_ch2.plot(pen=pg.mkPen('m', width=1.5))
         self.curve_ch2_env_lower = self.plot_ch2.plot(pen=pg.mkPen('m', width=1.5))
+        self.onset_marker_ch2 = pg.InfiniteLine(pos=0, angle=90, pen=pg.mkPen(color=(0, 255, 0), width=3))
+        self.onset_marker_ch2.setVisible(False)
+        self.plot_ch2.addItem(self.onset_marker_ch2)
 
         # FFT plots
         self.plot_fft1 = self.graphics.addPlot(row=0, col=1, title='CH1 FFT')
@@ -564,8 +628,9 @@ class PiezoCapture(QtWidgets.QMainWindow):
         # Horizontal
         print(f"Setting horizontal: {self.hdiv*1000:.0f}ms/div")
         send_command(self.sock, f'TDIV {self.hdiv}')
-        print("Setting horizontal delay: -120ms (left shift)")
-        send_command(self.sock, 'TRDL -0.12')
+        delay_sec = self.trigger_delay_ms / 1000.0
+        print(f"Setting horizontal delay: {self.trigger_delay_ms}ms")
+        send_command(self.sock, f'TRDL {delay_sec}')
 
         # Trigger
         print(f"Setting trigger: C1 @ {self.trigger_level}V")
@@ -616,7 +681,7 @@ class PiezoCapture(QtWidgets.QMainWindow):
             env1 = compute_envelope(wf1, smooth_window=self.envelope_smooth)
             env2 = compute_envelope(wf2, smooth_window=self.envelope_smooth)
             self._update_plots(wf1, env1, wf2, env2)
-            corr = analyze_correlation(env1, env2, wf1, wf2)
+            corr = analyze_correlation(env1, env2)
             self._update_correlation_display(corr)
             print("  Initial capture successful")
         else:
@@ -647,8 +712,20 @@ class PiezoCapture(QtWidgets.QMainWindow):
         self.cosine_sim_label.setText(f"{corr['cosine_similarity']:.3f}")
         self.ncc_peak_label.setText(f"{corr['ncc_peak']:.1f}")
         self.ncc_lag_label.setText(f"{corr['ncc_lag_samples']} samples")
+        self.onset_lag_label.setText(f"{corr['onset_lag_samples']} samples")
         self.peak_lag_label.setText(f"{corr['peak_lag_samples']} samples")
         self.amp_ratio_label.setText(f"{corr['amplitude_ratio']:.3f}")
+
+        # Update onset markers
+        if self.current_time_array is not None:
+            onset1_idx = corr['onset1_idx']
+            onset2_idx = corr['onset2_idx']
+            if onset1_idx < len(self.current_time_array):
+                t1 = self.current_time_array[onset1_idx]
+                self.onset_marker_ch1.setPos(t1)
+            if onset2_idx < len(self.current_time_array):
+                t2 = self.current_time_array[onset2_idx]
+                self.onset_marker_ch2.setPos(t2)
 
     def _arm_trigger(self, force_mode=False):
         """Arm the trigger. In NORMAL mode, scope auto-rearms so we just clear INR."""
@@ -680,6 +757,20 @@ class PiezoCapture(QtWidgets.QMainWindow):
         self.interpolate_enabled = self.interp_cb.isChecked()
         self.upsample_factor = self.upsample_spin.value()
         self.upsample_spin.setEnabled(self.interpolate_enabled)
+
+    def _on_delay_changed(self, value):
+        """Handle trigger delay change."""
+        self.trigger_delay_ms = value
+        if self.sock:
+            delay_sec = value / 1000.0
+            # Send directly without blocking *OPC? for responsive GUI
+            self.sock.sendall(f'TRDL {delay_sec}\n'.encode())
+
+    def _on_onset_markers_changed(self, state):
+        """Toggle onset marker visibility."""
+        self.show_onset_markers = bool(state)
+        self.onset_marker_ch1.setVisible(self.show_onset_markers)
+        self.onset_marker_ch2.setVisible(self.show_onset_markers)
 
     def _apply_waveform_settings(self):
         """Apply current decimation settings to scope."""
@@ -756,7 +847,7 @@ class PiezoCapture(QtWidgets.QMainWindow):
             env1 = compute_envelope(wf1, smooth_window=self.envelope_smooth)
             env2 = compute_envelope(wf2, smooth_window=self.envelope_smooth)
             self._update_plots(wf1, env1, wf2, env2)
-            corr = analyze_correlation(env1, env2, wf1, wf2)
+            corr = analyze_correlation(env1, env2)
             self._update_correlation_display(corr)
             self.capture_count += 1
             self.capture_label.setText(str(self.capture_count))
@@ -812,7 +903,7 @@ class PiezoCapture(QtWidgets.QMainWindow):
         env2 = compute_envelope(wf2, smooth_window=self.envelope_smooth)
 
         # Analyze correlation
-        corr = analyze_correlation(env1, env2, wf1, wf2)
+        corr = analyze_correlation(env1, env2)
         print(f"Correlation: {corr['classification']} (score: {corr['correlation_score']:.3f})")
 
         # Update capture count
@@ -837,6 +928,7 @@ class PiezoCapture(QtWidgets.QMainWindow):
         # Time axis
         total_time = self.hdiv * 14 * 1000  # ms
         time_axis = np.linspace(0, total_time, len(wf1))
+        self.current_time_array = time_axis  # Store for onset markers
 
         # CH1 waveform + envelope
         self.curve_ch1.setData(time_axis, wf1 * 1000)
