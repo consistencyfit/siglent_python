@@ -457,12 +457,9 @@ class WaveletViewer(QtWidgets.QDialog):
         self.graphics.setFixedHeight(total_height)
         self.graphics.setMinimumWidth(1350)
 
-        # Performance: minimize viewport updates
-        self.graphics.setViewportUpdateMode(
-            QtWidgets.QGraphicsView.ViewportUpdateMode.BoundingRectViewportUpdate
-        )
-        self.graphics.setCacheMode(
-            QtWidgets.QGraphicsView.CacheModeFlag.CacheBackground
+        # Performance: cache the entire central layout as a static pixmap
+        self.graphics.ci.setCacheMode(
+            QtWidgets.QGraphicsItem.CacheMode.DeviceCoordinateCache
         )
 
         # Shared pens
@@ -480,10 +477,6 @@ class WaveletViewer(QtWidgets.QDialog):
             plot.setMenuEnabled(False)
             plot.hideButtons()
             plot.getViewBox().setMouseEnabled(x=False, y=False)
-
-            # Cache the viewbox for faster redraws
-            vb = plot.getViewBox()
-            vb.setCacheMode(QtWidgets.QGraphicsItem.CacheMode.DeviceCoordinateCache)
 
             # Downsample
             if len(t_ms) > max_pts:
@@ -1219,6 +1212,9 @@ class PiezoCapture(QtWidgets.QMainWindow):
 
     def _on_trigger(self):
         """Handle trigger event - capture and process."""
+        import time as _time
+        _t0 = _time.perf_counter()
+
         print("Trigger fired!")
         self.status_label.setText('Capturing...')
         self.status_label.setStyleSheet('color: blue; font-weight: bold;')
@@ -1229,7 +1225,9 @@ class PiezoCapture(QtWidgets.QMainWindow):
         upsample = self.upsample_factor if self.interpolate_enabled else 1
         wf1, _ = get_waveform(self.sock, 'C1', self.ch1_vdiv, upsample=upsample)
         wf2, _ = get_waveform(self.sock, 'C2', self.ch2_vdiv, upsample=upsample)
+        _t1 = _time.perf_counter()
         print(f"  CH1: {len(wf1)} samples, CH2: {len(wf2)} samples")
+        print(f"  PROFILE: waveform acquisition: {(_t1-_t0)*1000:.1f}ms")
 
         if len(wf1) == 0 or len(wf2) == 0:
             print("  No data received, re-arming...")
@@ -1239,9 +1237,13 @@ class PiezoCapture(QtWidgets.QMainWindow):
         # Compute envelopes
         env1 = compute_envelope(wf1, smooth_window=self.envelope_smooth)
         env2 = compute_envelope(wf2, smooth_window=self.envelope_smooth)
+        _t2 = _time.perf_counter()
+        print(f"  PROFILE: envelope computation: {(_t2-_t1)*1000:.1f}ms")
 
         # Analyze correlation
         corr = analyze_correlation(env1, env2)
+        _t3 = _time.perf_counter()
+        print(f"  PROFILE: correlation analysis: {(_t3-_t2)*1000:.1f}ms")
         print(f"Correlation: {corr['classification']} (score: {corr['correlation_score']:.3f})")
 
         # Update capture count
@@ -1253,9 +1255,13 @@ class PiezoCapture(QtWidgets.QMainWindow):
 
         # Update plots
         self._update_plots(wf1, env1, wf2, env2)
+        _t4 = _time.perf_counter()
 
         # Save data
         self._save_capture(wf1, env1, wf2, env2, corr)
+        _t5 = _time.perf_counter()
+        print(f"  PROFILE: save capture: {(_t5-_t4)*1000:.1f}ms")
+        print(f"  PROFILE: total _on_trigger: {(_t5-_t0)*1000:.1f}ms")
 
         # Re-arm trigger
         if self.running:
@@ -1263,6 +1269,9 @@ class PiezoCapture(QtWidgets.QMainWindow):
 
     def _update_plots(self, wf1, env1, wf2, env2):
         """Update all plots with new data."""
+        import time as _time
+        _t0 = _time.perf_counter()
+
         # Time axis
         total_time = self.hdiv * 14 * 1000  # ms
         time_axis = np.linspace(0, total_time, len(wf1))
@@ -1289,6 +1298,9 @@ class PiezoCapture(QtWidgets.QMainWindow):
         # Update onset label Y positions to top of envelope
         self.onset_label_ch2.setPos(self.onset_marker_ch2.value(), self.env2_max_mv * 0.9)
 
+        _t1 = _time.perf_counter()
+        print(f"  PROFILE: waveform plot updates: {(_t1-_t0)*1000:.1f}ms")
+
         # CWT analysis (10-1000 Hz)
         sample_rate = len(wf1) / (self.hdiv * 14)
 
@@ -1301,9 +1313,12 @@ class PiezoCapture(QtWidgets.QMainWindow):
 
         # Compute CWT correlation (store wavelets for visualization)
         num_freqs = self.num_wavelets_spin.value()
+        _t2 = _time.perf_counter()
         cwt_result = cwt_correlation(wf1_ds, wf2_ds, sample_rate_ds,
                                      freq_min=10, freq_max=1000, num_freqs=num_freqs,
                                      store_wavelets=True)
+        _t3 = _time.perf_counter()
+        print(f"  PROFILE: CWT correlation: {(_t3-_t2)*1000:.1f}ms")
         self.current_wavelets = cwt_result['wavelets']
 
         # Update scalogram displays
@@ -1349,6 +1364,9 @@ class PiezoCapture(QtWidgets.QMainWindow):
         self.gradient_legend1.setLabels(labels)
         self.gradient_legend2.setLabels(labels)
 
+        _t4 = _time.perf_counter()
+        print(f"  PROFILE: scalogram updates: {(_t4-_t3)*1000:.1f}ms")
+
         # Update CWT metrics labels
         self.cwt_coherence_label.setText(f"{cwt_result['cwt_coherence']:.3f}")
         self.cwt_score_label.setText(f"{cwt_result['cwt_score']:.3f}")
@@ -1356,6 +1374,9 @@ class PiezoCapture(QtWidgets.QMainWindow):
         self.peak_freq1_label.setText(f"{cwt_result['peak_freq1']:.1f} Hz")
         self.peak_freq2_label.setText(f"{cwt_result['peak_freq2']:.1f} Hz")
         self.spectral_corr_label.setText(f"{cwt_result['spectral_shape_corr']:.3f}")
+
+        _t5 = _time.perf_counter()
+        print(f"  PROFILE: total _update_plots: {(_t5-_t0)*1000:.1f}ms")
 
     def _save_capture(self, wf1, env1, wf2, env2, corr):
         """Save capture data to disk."""
@@ -1384,6 +1405,7 @@ class PiezoCapture(QtWidgets.QMainWindow):
         print(f"Saved capture: {timestamp}")
 
     def _signal_handler(self, signum, frame):
+        print("\nReceived SIGINT, closing gracefully...")
         self.close()
 
     def closeEvent(self, event):
