@@ -650,12 +650,14 @@ class PiezoCapture(QtWidgets.QMainWindow):
         self.peak_lag_label.setText(f"{corr['peak_lag_samples']} samples")
         self.amp_ratio_label.setText(f"{corr['amplitude_ratio']:.3f}")
 
-    def _arm_trigger(self):
-        """Arm the trigger in NORMAL mode."""
+    def _arm_trigger(self, force_mode=False):
+        """Arm the trigger. In NORMAL mode, scope auto-rearms so we just clear INR."""
         if self.sock:
-            self.sock.sendall(b'TRMD NORM\n')
-            time.sleep(0.05)
-            self.sock.sendall(b'INR?\n')  # Clear INR
+            if force_mode:
+                self.sock.sendall(b'TRMD NORM\n')
+                time.sleep(0.05)
+            # Just clear INR to detect next trigger
+            self.sock.sendall(b'INR?\n')
             self.sock.settimeout(0.2)
             try:
                 self.sock.recv(256)
@@ -698,7 +700,7 @@ class PiezoCapture(QtWidgets.QMainWindow):
     def _start_capture(self):
         self.running = True
         self.arm_btn.setText('Disarm Trigger')
-        self._arm_trigger()
+        self._arm_trigger(force_mode=True)
         self.poll_timer.start(50)  # Poll every 50ms
 
     def _disarm_trigger(self):
