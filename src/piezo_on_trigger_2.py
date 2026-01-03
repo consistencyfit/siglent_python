@@ -457,11 +457,6 @@ class WaveletViewer(QtWidgets.QDialog):
         self.graphics.setFixedHeight(total_height)
         self.graphics.setMinimumWidth(1350)
 
-        # Performance: cache the entire central layout as a static pixmap
-        self.graphics.ci.setCacheMode(
-            QtWidgets.QGraphicsItem.CacheMode.DeviceCoordinateCache
-        )
-
         # Shared pens
         pen_real = pg.mkPen('c', width=1.5)
         pen_imag = pg.mkPen('m', width=1.5, style=QtCore.Qt.PenStyle.DashLine)
@@ -504,6 +499,31 @@ class WaveletViewer(QtWidgets.QDialog):
             if col >= cols:
                 col = 0
                 row += 1
+
+        # Performance: cache the entire layout as a static pixmap AFTER all plots are added
+        self.graphics.ci.setCacheMode(
+            QtWidgets.QGraphicsItem.CacheMode.DeviceCoordinateCache
+        )
+        # Optimize the view for static content
+        self.graphics.setOptimizationFlag(
+            QtWidgets.QGraphicsView.OptimizationFlag.DontSavePainterState, True
+        )
+        self.graphics.setOptimizationFlag(
+            QtWidgets.QGraphicsView.OptimizationFlag.DontAdjustForAntialiasing, True
+        )
+        self.graphics.setViewportUpdateMode(
+            QtWidgets.QGraphicsView.ViewportUpdateMode.FullViewportUpdate
+        )
+        # Disable BSP indexing since we don't need hit-testing
+        self.graphics.scene().setItemIndexMethod(
+            QtWidgets.QGraphicsScene.ItemIndexMethod.NoIndex
+        )
+        # Use OpenGL for hardware-accelerated rendering
+        # try:
+        #     from PyQt6.QtOpenGLWidgets import QOpenGLWidget
+        #     self.graphics.setViewport(QOpenGLWidget())
+        # except ImportError:
+        #     pass  # Fall back to software rendering
 
         scroll.setWidget(self.graphics)
         layout.addWidget(scroll)
