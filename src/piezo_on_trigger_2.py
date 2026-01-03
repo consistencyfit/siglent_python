@@ -272,7 +272,7 @@ def analyze_correlation(env1, env2):
     }
 
 
-def compute_cwt(signal, sample_rate, freq_min=10, freq_max=1000, num_freqs=50):
+def compute_cwt(signal, sample_rate, freq_min=10, freq_max=1000, num_freqs=50, store_wavelets=False):
     """
     Compute Continuous Wavelet Transform using Morlet wavelet.
     Focuses on frequencies between freq_min and freq_max Hz.
@@ -281,6 +281,7 @@ def compute_cwt(signal, sample_rate, freq_min=10, freq_max=1000, num_freqs=50):
         freqs: array of frequencies
         cwt_matrix: complex CWT coefficients (num_freqs x len(signal))
         power: power spectrum (|cwt|^2)
+        wavelets: list of (freq, time_array, wavelet_real, wavelet_imag) if store_wavelets=True
     """
     # Remove DC offset
     signal = signal - np.mean(signal)
@@ -301,6 +302,7 @@ def compute_cwt(signal, sample_rate, freq_min=10, freq_max=1000, num_freqs=50):
     w = 6.0
 
     cwt_matrix = np.zeros((num_freqs, n), dtype=complex)
+    wavelets = [] if store_wavelets else None
 
     for i, freq in enumerate(freqs):
         # Scale for this frequency
@@ -318,15 +320,20 @@ def compute_cwt(signal, sample_rate, freq_min=10, freq_max=1000, num_freqs=50):
         wavelet = np.exp(1j * w * t / scale) * np.exp(-0.5 * (t / scale) ** 2)
         wavelet = wavelet / np.sqrt(scale)  # Normalize
 
+        if store_wavelets:
+            # Convert time to milliseconds
+            t_ms = t / sample_rate * 1000
+            wavelets.append((freq, t_ms, wavelet.real.copy(), wavelet.imag.copy()))
+
         # Convolve signal with wavelet
         conv_result = np.convolve(signal, wavelet, mode='same')
         cwt_matrix[i, :] = conv_result[:n] if len(conv_result) >= n else np.pad(conv_result, (0, n - len(conv_result)))
 
     power = np.abs(cwt_matrix) ** 2
-    return freqs, cwt_matrix, power
+    return freqs, cwt_matrix, power, wavelets
 
 
-def cwt_correlation(wf1, wf2, sample_rate, freq_min=10, freq_max=1000, num_freqs=50):
+def cwt_correlation(wf1, wf2, sample_rate, freq_min=10, freq_max=1000, num_freqs=50, store_wavelets=False):
     """
     Compute correlation between two signals using CWT.
 
@@ -336,10 +343,11 @@ def cwt_correlation(wf1, wf2, sample_rate, freq_min=10, freq_max=1000, num_freqs
         - energy_profile_corr: correlation of energy profiles
         - peak_freq_diff: difference in peak frequencies
         - cwt_score: combined CWT-based correlation score
+        - wavelets: list of wavelet data if store_wavelets=True
     """
     # Compute CWT for both signals
-    freqs, cwt1, power1 = compute_cwt(wf1, sample_rate, freq_min, freq_max, num_freqs)
-    _, cwt2, power2 = compute_cwt(wf2, sample_rate, freq_min, freq_max, num_freqs)
+    freqs, cwt1, power1, wavelets = compute_cwt(wf1, sample_rate, freq_min, freq_max, num_freqs, store_wavelets)
+    _, cwt2, power2, _ = compute_cwt(wf2, sample_rate, freq_min, freq_max, num_freqs, store_wavelets=False)
 
     # 1. Wavelet coherence: cross-spectrum normalized by auto-spectra
     cross_spectrum = cwt1 * np.conj(cwt2)
@@ -404,7 +412,91 @@ def cwt_correlation(wf1, wf2, sample_rate, freq_min=10, freq_max=1000, num_freqs
         'freqs': freqs,
         'power1': power1,
         'power2': power2,
+        'wavelets': wavelets,
     }
+
+
+class WaveletViewer(QtWidgets.QDialog):
+    """Dialog to display all wavelets used in CWT."""
+
+    def __init__(self, wavelets, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle('CWT Wavelets (Morlet)')
+        self.resize(1400, 900)
+
+        layout = QtWidgets.QVBoxLayout(self)
+
+        # Info label with legend
+        info = QtWidgets.QLabel(
+            f'<b>{len(wavelets)} Morlet wavelets</b> | '
+            '<span style="color: cyan;">━ Real (cos)</span> · '
+            '<span style="color: magenta;">┅ Imag (sin)</span> · '
+            '<span style="color: yellow;">━ Envelope</span>'
+        )
+        info.setStyleSheet('font-size: 13px; padding: 5px;')
+        layout.addWidget(info)
+
+        # Scroll area for wavelets
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+
+        # Create a plot for each wavelet
+        cols = 4
+        num_rows = (len(wavelets) + cols - 1) // cols
+        plot_height = 180
+        total_height = num_rows * plot_height + 50
+
+        # Use OpenGL for better performance
+        graphics = pg.GraphicsLayoutWidget()
+        graphics.setBackground('#1e1e1e')
+        graphics.setMinimumHeight(total_height)
+        graphics.setFixedHeight(total_height)
+        graphics.useOpenGL(True)
+
+        row, col = 0, 0
+        for i, (freq, t_ms, real, imag) in enumerate(wavelets):
+            plot = graphics.addPlot(row=row, col=col, title=f'{freq:.1f} Hz')
+            plot.hideAxis('bottom')  # Hide axis labels to reduce clutter
+            plot.showGrid(x=True, y=True, alpha=0.3)
+
+            # Disable mouse interaction
+            plot.setMouseEnabled(x=False, y=False)
+            plot.setMenuEnabled(False)
+
+            # Downsample for performance (max 150 points per plot)
+            max_pts = 150
+            if len(t_ms) > max_pts:
+                step = len(t_ms) // max_pts
+                t_ms = t_ms[::step]
+                real = real[::step]
+                imag = imag[::step]
+
+            # Plot with simple pens (no antialiasing for speed)
+            plot.plot(t_ms, real, pen=pg.mkPen('c', width=1))
+            plot.plot(t_ms, imag, pen=pg.mkPen('m', width=1, style=QtCore.Qt.PenStyle.DotLine))
+
+            # Show envelope
+            envelope = np.sqrt(real**2 + imag**2)
+            plot.plot(t_ms, envelope, pen=pg.mkPen('y', width=1))
+            plot.plot(t_ms, -envelope, pen=pg.mkPen('y', width=1))
+
+            # Auto-range
+            plot.enableAutoRange()
+
+            col += 1
+            if col >= cols:
+                col = 0
+                row += 1
+
+        scroll.setWidget(graphics)
+        layout.addWidget(scroll)
+
+        # Close button
+        close_btn = QtWidgets.QPushButton('Close')
+        close_btn.clicked.connect(self.close)
+        layout.addWidget(close_btn)
 
 
 class SpinnerOverlay(QtWidgets.QWidget):
@@ -755,6 +847,11 @@ class PiezoCapture(QtWidgets.QMainWindow):
         self.gradient_legend2.setGradient(self.cwt_cmap.getGradient())
         self.gradient_legend2.setLabels({'0 dB': 1.0, '-60 dB': 0.0})
 
+        # Click handler for scalograms to show wavelets
+        self.current_wavelets = None
+        self.img_cwt1.mouseClickEvent = self._on_scalogram_click
+        self.img_cwt2.mouseClickEvent = self._on_scalogram_click
+
         # Link X axes
         self.plot_ch2.setXLink(self.plot_ch1)
         self.plot_cwt2.setXLink(self.plot_cwt1)
@@ -974,6 +1071,12 @@ class PiezoCapture(QtWidgets.QMainWindow):
         self.onset_label_ch1.setVisible(self.show_onset_markers)
         self.onset_label_ch2.setVisible(self.show_onset_markers)
 
+    def _on_scalogram_click(self, event):
+        """Handle click on scalogram to show wavelets."""
+        if self.current_wavelets is not None:
+            viewer = WaveletViewer(self.current_wavelets, self)
+            viewer.show()
+
     def _apply_waveform_settings(self):
         """Apply current decimation settings to scope."""
         if self.decimate_enabled:
@@ -1163,9 +1266,11 @@ class PiezoCapture(QtWidgets.QMainWindow):
         sample_rate_ds = sample_rate / ds_factor
         print(f"CWT: {len(wf1)} -> {len(wf1_ds)} samples (ds={ds_factor}), sample_rate={sample_rate_ds:.0f} Hz")
 
-        # Compute CWT correlation
+        # Compute CWT correlation (store wavelets for visualization)
         cwt_result = cwt_correlation(wf1_ds, wf2_ds, sample_rate_ds,
-                                     freq_min=10, freq_max=1000, num_freqs=40)
+                                     freq_min=10, freq_max=1000, num_freqs=40,
+                                     store_wavelets=True)
+        self.current_wavelets = cwt_result['wavelets']
 
         # Update scalogram displays
         power1_db = 10 * np.log10(cwt_result['power1'] + 1e-10)
