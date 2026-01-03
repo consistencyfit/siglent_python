@@ -487,11 +487,6 @@ class WaveletViewer(QtWidgets.QDialog):
             plot.plot(t_ms, envelope, pen=pen_env)
             plot.plot(t_ms, -envelope, pen=pen_env)
 
-            # Set fixed range
-            plot.setXRange(t_ms[0], t_ms[-1], padding=0.02)
-            y_max = max(np.max(np.abs(real)), np.max(envelope)) * 1.1
-            plot.setYRange(-y_max, y_max, padding=0)
-
             # Set row height
             self.graphics.ci.layout.setRowMinimumHeight(row, plot_height)
 
@@ -499,31 +494,6 @@ class WaveletViewer(QtWidgets.QDialog):
             if col >= cols:
                 col = 0
                 row += 1
-
-        # Performance: cache the entire layout as a static pixmap AFTER all plots are added
-        self.graphics.ci.setCacheMode(
-            QtWidgets.QGraphicsItem.CacheMode.DeviceCoordinateCache
-        )
-        # Optimize the view for static content
-        self.graphics.setOptimizationFlag(
-            QtWidgets.QGraphicsView.OptimizationFlag.DontSavePainterState, True
-        )
-        self.graphics.setOptimizationFlag(
-            QtWidgets.QGraphicsView.OptimizationFlag.DontAdjustForAntialiasing, True
-        )
-        self.graphics.setViewportUpdateMode(
-            QtWidgets.QGraphicsView.ViewportUpdateMode.FullViewportUpdate
-        )
-        # Disable BSP indexing since we don't need hit-testing
-        self.graphics.scene().setItemIndexMethod(
-            QtWidgets.QGraphicsScene.ItemIndexMethod.NoIndex
-        )
-        # Use OpenGL for hardware-accelerated rendering
-        # try:
-        #     from PyQt6.QtOpenGLWidgets import QOpenGLWidget
-        #     self.graphics.setViewport(QOpenGLWidget())
-        # except ImportError:
-        #     pass  # Fall back to software rendering
 
         scroll.setWidget(self.graphics)
         layout.addWidget(scroll)
@@ -597,7 +567,7 @@ class PiezoCapture(QtWidgets.QMainWindow):
         self.ch1_vdiv = 0.07
         self.ch2_vdiv = 0.07
         self.hdiv = 0.02
-        self.trigger_level = 0.030
+        self.trigger_level = 0.050
         self.capture_count = 0
         self.running = False
 
