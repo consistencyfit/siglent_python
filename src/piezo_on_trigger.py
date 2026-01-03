@@ -517,7 +517,7 @@ class PiezoCapture(QtWidgets.QMainWindow):
         corr_grid.addWidget(QtWidgets.QLabel('Peak lag:'), 3, 4)
         corr_grid.addWidget(self.peak_lag_label, 3, 5)
 
-        # Spectral centroids
+        # Spectral centroids - raw
         self.centroid1_label = QtWidgets.QLabel('--')
         corr_grid.addWidget(QtWidgets.QLabel('CH1 centroid:'), 3, 0)
         corr_grid.addWidget(self.centroid1_label, 3, 1)
@@ -525,6 +525,24 @@ class PiezoCapture(QtWidgets.QMainWindow):
         self.centroid2_label = QtWidgets.QLabel('--')
         corr_grid.addWidget(QtWidgets.QLabel('CH2 centroid:'), 3, 2)
         corr_grid.addWidget(self.centroid2_label, 3, 3)
+
+        # Spectral centroids - DC removed
+        self.centroid1_ac_label = QtWidgets.QLabel('--')
+        corr_grid.addWidget(QtWidgets.QLabel('CH1 AC cent:'), 4, 0)
+        corr_grid.addWidget(self.centroid1_ac_label, 4, 1)
+
+        self.centroid2_ac_label = QtWidgets.QLabel('--')
+        corr_grid.addWidget(QtWidgets.QLabel('CH2 AC cent:'), 4, 2)
+        corr_grid.addWidget(self.centroid2_ac_label, 4, 3)
+
+        # Spectral centroids - normalized
+        self.centroid1_norm_label = QtWidgets.QLabel('--')
+        corr_grid.addWidget(QtWidgets.QLabel('CH1 norm cent:'), 5, 0)
+        corr_grid.addWidget(self.centroid1_norm_label, 5, 1)
+
+        self.centroid2_norm_label = QtWidgets.QLabel('--')
+        corr_grid.addWidget(QtWidgets.QLabel('CH2 norm cent:'), 5, 2)
+        corr_grid.addWidget(self.centroid2_norm_label, 5, 3)
 
         layout.addWidget(corr_group)
 
@@ -989,27 +1007,49 @@ class PiezoCapture(QtWidgets.QMainWindow):
 
         # FFT and spectral centroids
         sample_rate = len(wf1) / (self.hdiv * 14)
-        centroids = []
+        centroids_raw = []
+        centroids_ac = []
+        centroids_norm = []
 
         for wf, curve in [(wf1, self.curve_fft1), (wf2, self.curve_fft2)]:
             n = len(wf)
+            freqs = np.fft.fftfreq(n, 1/sample_rate)[:n//2]
+
+            # Raw waveform FFT (for display)
             fft_vals = np.fft.fft(wf)
             fft_mag = np.abs(fft_vals[:n//2]) * 2 / n
-            freqs = np.fft.fftfreq(n, 1/sample_rate)[:n//2]
             fft_db = 20 * np.log10(fft_mag + 1e-10)
             curve.setData(freqs, fft_db)
 
-            # Compute spectral centroid: sum(freq * mag) / sum(mag)
+            # Centroid 1: Raw waveform
             mag_sum = np.sum(fft_mag)
-            if mag_sum > 0:
-                centroid = np.sum(freqs * fft_mag) / mag_sum
-            else:
-                centroid = 0
-            centroids.append(centroid)
+            centroid_raw = np.sum(freqs * fft_mag) / mag_sum if mag_sum > 0 else 0
+            centroids_raw.append(centroid_raw)
+
+            # Centroid 2: DC removed (AC only)
+            wf_ac = wf - np.mean(wf)
+            fft_ac = np.fft.fft(wf_ac)
+            fft_mag_ac = np.abs(fft_ac[:n//2]) * 2 / n
+            mag_sum_ac = np.sum(fft_mag_ac)
+            centroid_ac = np.sum(freqs * fft_mag_ac) / mag_sum_ac if mag_sum_ac > 0 else 0
+            centroids_ac.append(centroid_ac)
+
+            # Centroid 3: Normalized (zero mean, unit variance)
+            wf_std = np.std(wf)
+            wf_norm = (wf - np.mean(wf)) / wf_std if wf_std > 0 else wf - np.mean(wf)
+            fft_norm = np.fft.fft(wf_norm)
+            fft_mag_norm = np.abs(fft_norm[:n//2]) * 2 / n
+            mag_sum_norm = np.sum(fft_mag_norm)
+            centroid_norm = np.sum(freqs * fft_mag_norm) / mag_sum_norm if mag_sum_norm > 0 else 0
+            centroids_norm.append(centroid_norm)
 
         # Update centroid labels
-        self.centroid1_label.setText(f"{centroids[0]:.1f} Hz")
-        self.centroid2_label.setText(f"{centroids[1]:.1f} Hz")
+        self.centroid1_label.setText(f"{centroids_raw[0]:.1f} Hz")
+        self.centroid2_label.setText(f"{centroids_raw[1]:.1f} Hz")
+        self.centroid1_ac_label.setText(f"{centroids_ac[0]:.1f} Hz")
+        self.centroid2_ac_label.setText(f"{centroids_ac[1]:.1f} Hz")
+        self.centroid1_norm_label.setText(f"{centroids_norm[0]:.1f} Hz")
+        self.centroid2_norm_label.setText(f"{centroids_norm[1]:.1f} Hz")
 
         # Set FFT x limit
         self.plot_fft1.setXRange(0, min(sample_rate/2, 5000))
