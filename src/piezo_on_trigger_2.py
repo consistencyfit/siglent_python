@@ -417,7 +417,7 @@ def cwt_correlation(wf1, wf2, sample_rate, freq_min=10, freq_max=1000, num_freqs
 
 
 class WaveletViewer(QtWidgets.QDialog):
-    """Dialog to display all wavelets used in CWT."""
+    """Dialog to display all wavelets used in CWT - scrollable via QScrollArea."""
 
     def __init__(self, wavelets, parent=None):
         super().__init__(parent)
@@ -428,6 +428,7 @@ class WaveletViewer(QtWidgets.QDialog):
         cols = 4
         num_rows = (n_wavelets + cols - 1) // cols
         plot_height = 180
+        total_height = num_rows * plot_height + 20
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(5, 5, 5, 5)
@@ -442,17 +443,27 @@ class WaveletViewer(QtWidgets.QDialog):
         info.setStyleSheet('font-size: 13px; padding: 5px;')
         layout.addWidget(info)
 
-        # Use QScrollArea with a container widget for the plots
+        # QScrollArea to handle scrolling
         scroll = QtWidgets.QScrollArea()
-        scroll.setWidgetResizable(True)
+        scroll.setWidgetResizable(False)  # Don't resize content to fit
         scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
 
-        # Container widget with grid layout for plot widgets
-        container = QtWidgets.QWidget()
-        grid = QtWidgets.QGridLayout(container)
-        grid.setSpacing(5)
-        grid.setContentsMargins(5, 5, 5, 5)
+        # Single GraphicsLayoutWidget with fixed height for all content
+        self.graphics = pg.GraphicsLayoutWidget()
+        self.graphics.setBackground('#1e1e1e')
+        self.graphics.ci.setSpacing(5)
+        self.graphics.setFixedHeight(total_height)
+        self.graphics.setMinimumWidth(1350)
+
+        # Performance: minimize viewport updates
+        self.graphics.setViewportUpdateMode(
+            QtWidgets.QGraphicsView.ViewportUpdateMode.BoundingRectViewportUpdate
+        )
+        self.graphics.setCacheMode(
+            QtWidgets.QGraphicsView.CacheModeFlag.CacheBackground
+        )
 
         # Shared pens
         pen_real = pg.mkPen('c', width=1.5)
@@ -462,15 +473,17 @@ class WaveletViewer(QtWidgets.QDialog):
         max_pts = 200
         row, col = 0, 0
         for freq, t_ms, real, imag in wavelets:
-            # Create individual PlotWidget with fixed minimum size
-            pw = pg.PlotWidget(background='#1e1e1e', title=f'{freq:.1f} Hz')
-            pw.setMinimumSize(300, plot_height)
-            pw.hideAxis('bottom')
-            pw.hideAxis('left')
-            pw.setMouseEnabled(x=False, y=False)
-            pw.setMenuEnabled(False)
-            pw.hideButtons()
-            pw.getPlotItem().getViewBox().setMouseEnabled(x=False, y=False)
+            plot = self.graphics.addPlot(row=row, col=col, title=f'{freq:.1f} Hz')
+            plot.hideAxis('bottom')
+            plot.hideAxis('left')
+            plot.setMouseEnabled(x=False, y=False)
+            plot.setMenuEnabled(False)
+            plot.hideButtons()
+            plot.getViewBox().setMouseEnabled(x=False, y=False)
+
+            # Cache the viewbox for faster redraws
+            vb = plot.getViewBox()
+            vb.setCacheMode(QtWidgets.QGraphicsItem.CacheMode.DeviceCoordinateCache)
 
             # Downsample
             if len(t_ms) > max_pts:
@@ -481,24 +494,25 @@ class WaveletViewer(QtWidgets.QDialog):
 
             envelope = np.sqrt(real**2 + imag**2)
 
-            pw.plot(t_ms, real, pen=pen_real)
-            pw.plot(t_ms, imag, pen=pen_imag)
-            pw.plot(t_ms, envelope, pen=pen_env)
-            pw.plot(t_ms, -envelope, pen=pen_env)
+            plot.plot(t_ms, real, pen=pen_real)
+            plot.plot(t_ms, imag, pen=pen_imag)
+            plot.plot(t_ms, envelope, pen=pen_env)
+            plot.plot(t_ms, -envelope, pen=pen_env)
 
             # Set fixed range
-            pw.setXRange(t_ms[0], t_ms[-1], padding=0.02)
+            plot.setXRange(t_ms[0], t_ms[-1], padding=0.02)
             y_max = max(np.max(np.abs(real)), np.max(envelope)) * 1.1
-            pw.setYRange(-y_max, y_max, padding=0)
+            plot.setYRange(-y_max, y_max, padding=0)
 
-            grid.addWidget(pw, row, col)
+            # Set row height
+            self.graphics.ci.layout.setRowMinimumHeight(row, plot_height)
 
             col += 1
             if col >= cols:
                 col = 0
                 row += 1
 
-        scroll.setWidget(container)
+        scroll.setWidget(self.graphics)
         layout.addWidget(scroll)
 
         # Close button
