@@ -570,7 +570,7 @@ class PiezoCapture(QtWidgets.QMainWindow):
         self.ch1_vdiv = 0.07
         self.ch2_vdiv = 0.07
         self.hdiv = 0.02
-        self.trigger_level = 0.0050
+        self.trigger_level = 0.030
         self.capture_count = 0
         self.running = False
 
