@@ -416,13 +416,54 @@ def cwt_correlation(wf1, wf2, sample_rate, freq_min=10, freq_max=1000, num_freqs
     }
 
 
+class WaveletWorker(QtCore.QThread):
+    """Worker thread to prepare wavelet plot data."""
+    finished = QtCore.pyqtSignal(list)
+
+    def __init__(self, wavelets):
+        super().__init__()
+        self.wavelets = wavelets
+
+    def run(self):
+        """Prepare downsampled data in background thread."""
+        prepared = []
+        max_pts = 200
+        for freq, t_ms, real, imag in self.wavelets:
+            if len(t_ms) > max_pts:
+                step = len(t_ms) // max_pts
+                t_ms = t_ms[::step]
+                real = real[::step]
+                imag = imag[::step]
+            envelope = np.sqrt(real**2 + imag**2)
+            prepared.append((freq, t_ms, real, imag, envelope))
+        self.finished.emit(prepared)
+
+
 class WaveletViewer(QtWidgets.QDialog):
     """Dialog to display all wavelets used in CWT."""
+
+    # Class-level cache for reusable pens
+    _pen_real = None
+    _pen_imag = None
+    _pen_env = None
+
+    @classmethod
+    def _get_pens(cls):
+        """Lazily create and cache pens."""
+        if cls._pen_real is None:
+            cls._pen_real = pg.mkPen('c', width=1.5)
+            cls._pen_imag = pg.mkPen('m', width=1.5, style=QtCore.Qt.PenStyle.DashLine)
+            cls._pen_env = pg.mkPen('y', width=1)
+        return cls._pen_real, cls._pen_imag, cls._pen_env
 
     def __init__(self, wavelets, parent=None):
         super().__init__(parent)
         self.setWindowTitle('CWT Wavelets (Morlet)')
         self.resize(1400, 900)
+        self.setAttribute(QtCore.Qt.WidgetAttribute.WA_DeleteOnClose)
+
+        self._plots = []
+        self._curves = []
 
         layout = QtWidgets.QVBoxLayout(self)
 
@@ -436,67 +477,75 @@ class WaveletViewer(QtWidgets.QDialog):
         info.setStyleSheet('font-size: 13px; padding: 5px;')
         layout.addWidget(info)
 
-        # Scroll area for wavelets
+        # Scroll area
         scroll = QtWidgets.QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
 
-        # Create a plot for each wavelet
+        # Graphics layout - create structure first, populate data later
         cols = 4
         num_rows = (len(wavelets) + cols - 1) // cols
         plot_height = 180
         total_height = num_rows * plot_height + 50
 
-        # Use OpenGL for better performance
-        graphics = pg.GraphicsLayoutWidget()
-        graphics.setBackground('#1e1e1e')
-        graphics.setMinimumHeight(total_height)
-        graphics.setFixedHeight(total_height)
-        graphics.useOpenGL(True)
+        self.graphics = pg.GraphicsLayoutWidget()
+        self.graphics.setBackground('#1e1e1e')
+        self.graphics.setMinimumHeight(total_height)
+        self.graphics.setFixedHeight(total_height)
 
+        # Pre-create all plot structures (empty)
+        pen_real, pen_imag, pen_env = self._get_pens()
         row, col = 0, 0
-        for i, (freq, t_ms, real, imag) in enumerate(wavelets):
-            plot = graphics.addPlot(row=row, col=col, title=f'{freq:.1f} Hz')
-            plot.hideAxis('bottom')  # Hide axis labels to reduce clutter
-            plot.showGrid(x=True, y=True, alpha=0.3)
-
-            # Disable mouse interaction
+        for i, (freq, _, _, _) in enumerate(wavelets):
+            plot = self.graphics.addPlot(row=row, col=col, title=f'{freq:.1f} Hz')
+            plot.hideAxis('bottom')
+            plot.hideAxis('left')
             plot.setMouseEnabled(x=False, y=False)
             plot.setMenuEnabled(False)
 
-            # Downsample for performance (max 150 points per plot)
-            max_pts = 150
-            if len(t_ms) > max_pts:
-                step = len(t_ms) // max_pts
-                t_ms = t_ms[::step]
-                real = real[::step]
-                imag = imag[::step]
+            # Pre-create curve items (empty data)
+            c_real = plot.plot([], [], pen=pen_real)
+            c_imag = plot.plot([], [], pen=pen_imag)
+            c_env_up = plot.plot([], [], pen=pen_env)
+            c_env_down = plot.plot([], [], pen=pen_env)
 
-            # Plot with simple pens (no antialiasing for speed)
-            plot.plot(t_ms, real, pen=pg.mkPen('c', width=1))
-            plot.plot(t_ms, imag, pen=pg.mkPen('m', width=1, style=QtCore.Qt.PenStyle.DotLine))
-
-            # Show envelope
-            envelope = np.sqrt(real**2 + imag**2)
-            plot.plot(t_ms, envelope, pen=pg.mkPen('y', width=1))
-            plot.plot(t_ms, -envelope, pen=pg.mkPen('y', width=1))
-
-            # Auto-range
-            plot.enableAutoRange()
+            self._plots.append(plot)
+            self._curves.append((c_real, c_imag, c_env_up, c_env_down))
 
             col += 1
             if col >= cols:
                 col = 0
                 row += 1
 
-        scroll.setWidget(graphics)
+        scroll.setWidget(self.graphics)
         layout.addWidget(scroll)
 
         # Close button
         close_btn = QtWidgets.QPushButton('Close')
         close_btn.clicked.connect(self.close)
         layout.addWidget(close_btn)
+
+        # Start worker thread to prepare data
+        self.worker = WaveletWorker(wavelets)
+        self.worker.finished.connect(self._on_data_ready)
+        self.worker.start()
+
+    def _on_data_ready(self, prepared_data):
+        """Update plots with prepared data (called from main thread)."""
+        for i, (freq, t_ms, real, imag, envelope) in enumerate(prepared_data):
+            c_real, c_imag, c_env_up, c_env_down = self._curves[i]
+            c_real.setData(t_ms, real)
+            c_imag.setData(t_ms, imag)
+            c_env_up.setData(t_ms, envelope)
+            c_env_down.setData(t_ms, -envelope)
+            self._plots[i].enableAutoRange()
+
+    def closeEvent(self, event):
+        """Clean up worker thread on close."""
+        if self.worker.isRunning():
+            self.worker.quit()
+            self.worker.wait()
+        super().closeEvent(event)
 
 
 class SpinnerOverlay(QtWidgets.QWidget):
