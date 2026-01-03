@@ -524,8 +524,9 @@ class PiezoCapture(QtWidgets.QMainWindow):
         self.current_time_array = None
 
         # DWT settings
-        self.dwt_wavelet = 'db4'
+        self.dwt_wavelet = 'db2'  # Shorter wavelet = better time resolution for transients
         self.dwt_max_level = 8
+        self.dwt_target_samples = 10000  # Target samples for DWT (higher = better resolution)
 
         # Create captures directory
         self.captures_dir = Path('captures')
@@ -647,7 +648,7 @@ class PiezoCapture(QtWidgets.QMainWindow):
         # DWT wavelet selector
         controls.addWidget(QtWidgets.QLabel('Wavelet:'))
         self.wavelet_combo = QtWidgets.QComboBox()
-        self.wavelet_combo.addItems(['db4', 'db8', 'sym4', 'sym8', 'coif4', 'haar'])
+        self.wavelet_combo.addItems(['haar', 'db2', 'db4', 'db8', 'sym4', 'sym8', 'coif4'])
         self.wavelet_combo.setCurrentText(self.dwt_wavelet)
         self.wavelet_combo.currentTextChanged.connect(lambda w: setattr(self, 'dwt_wavelet', w))
         controls.addWidget(self.wavelet_combo)
@@ -659,6 +660,15 @@ class PiezoCapture(QtWidgets.QMainWindow):
         self.levels_spin.setValue(self.dwt_max_level)
         self.levels_spin.valueChanged.connect(lambda v: setattr(self, 'dwt_max_level', v))
         controls.addWidget(self.levels_spin)
+
+        # DWT target samples
+        controls.addWidget(QtWidgets.QLabel('Samples:'))
+        self.dwt_samples_spin = QtWidgets.QSpinBox()
+        self.dwt_samples_spin.setRange(2000, 50000)
+        self.dwt_samples_spin.setSingleStep(1000)
+        self.dwt_samples_spin.setValue(self.dwt_target_samples)
+        self.dwt_samples_spin.valueChanged.connect(lambda v: setattr(self, 'dwt_target_samples', v))
+        controls.addWidget(self.dwt_samples_spin)
 
         controls.addStretch()
 
@@ -1152,7 +1162,7 @@ class PiezoCapture(QtWidgets.QMainWindow):
         sample_rate = len(wf1) / (self.hdiv * 14)
 
         # Downsample for faster computation
-        ds_factor = max(1, len(wf1) // 4000)
+        ds_factor = max(1, len(wf1) // self.dwt_target_samples)
         wf1_ds = wf1[::ds_factor]
         wf2_ds = wf2[::ds_factor]
         sample_rate_ds = sample_rate / ds_factor
