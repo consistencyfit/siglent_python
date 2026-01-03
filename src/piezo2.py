@@ -653,8 +653,14 @@ class PiezoCapture(QtWidgets.QMainWindow):
     def _arm_trigger(self):
         """Arm the trigger in NORMAL mode."""
         if self.sock:
-            send_command(self.sock, 'TRMD NORM')
-            query(self.sock, 'INR?')  # Clear INR
+            self.sock.sendall(b'TRMD NORM\n')
+            time.sleep(0.05)
+            self.sock.sendall(b'INR?\n')  # Clear INR
+            self.sock.settimeout(0.2)
+            try:
+                self.sock.recv(256)
+            except:
+                pass
             print("Waiting for trigger...")
             self.status_label.setText('Trigger armed - waiting...')
             self.status_label.setStyleSheet('color: orange; font-weight: bold;')
