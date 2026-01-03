@@ -285,36 +285,42 @@ def compute_cwt(signal, sample_rate, freq_min=10, freq_max=1000, num_freqs=50):
     # Remove DC offset
     signal = signal - np.mean(signal)
 
+    n = len(signal)
+
+    # Limit minimum frequency based on signal length to ensure good time resolution
+    # Need at least 4 cycles of the wavelet to fit in the signal
+    min_freq_possible = max(freq_min, 4 * sample_rate / n)
+    if min_freq_possible > freq_min:
+        print(f"  CWT: Adjusting freq_min from {freq_min} to {min_freq_possible:.1f} Hz for signal length")
+        freq_min = min_freq_possible
+
     # Create logarithmically spaced frequencies
     freqs = np.logspace(np.log10(freq_min), np.log10(freq_max), num_freqs)
 
     # Morlet wavelet parameter (higher = better frequency resolution, worse time resolution)
     w = 6.0
 
-    n = len(signal)
     cwt_matrix = np.zeros((num_freqs, n), dtype=complex)
 
     for i, freq in enumerate(freqs):
         # Scale for this frequency
         scale = w * sample_rate / (2 * np.pi * freq)
 
-        # Create Morlet wavelet
-        wavelet_len = min(int(10 * scale), n)
+        # Create Morlet wavelet - limit to 1/4 of signal length max for good time localization
+        max_wavelet_len = n // 4
+        wavelet_len = min(int(6 * scale), max_wavelet_len)
+        if wavelet_len < 3:
+            wavelet_len = 3
         if wavelet_len % 2 == 0:
             wavelet_len += 1
+
         t = np.arange(wavelet_len) - wavelet_len // 2
         wavelet = np.exp(1j * w * t / scale) * np.exp(-0.5 * (t / scale) ** 2)
         wavelet = wavelet / np.sqrt(scale)  # Normalize
 
-        # Convolve signal with wavelet - ensure output matches signal length
+        # Convolve signal with wavelet
         conv_result = np.convolve(signal, wavelet, mode='same')
-        # Handle potential length mismatch
-        if len(conv_result) > n:
-            cwt_matrix[i, :] = conv_result[:n]
-        elif len(conv_result) < n:
-            cwt_matrix[i, :len(conv_result)] = conv_result
-        else:
-            cwt_matrix[i, :] = conv_result
+        cwt_matrix[i, :] = conv_result[:n] if len(conv_result) >= n else np.pad(conv_result, (0, n - len(conv_result)))
 
     power = np.abs(cwt_matrix) ** 2
     return freqs, cwt_matrix, power
@@ -735,17 +741,19 @@ class PiezoCapture(QtWidgets.QMainWindow):
         self.img_cwt2 = pg.ImageItem()
         self.plot_cwt2.addItem(self.img_cwt2)
 
-        # Shared colorbar spanning both scalogram plots
+        # Colormap for scalograms
         self.cwt_cmap = pg.colormap.get('viridis')
-        self.colorbar = pg.ColorBarItem(
-            values=(-60, 0),
-            colorMap=self.cwt_cmap,
-            label='dB',
-            limits=(-80, 20),
-            interactive=False
-        )
-        # Add colorbar to layout spanning both rows
-        self.graphics.addItem(self.colorbar, row=0, col=2, rowspan=2)
+
+        # Add gradient legend to both scalogram plots
+        self.gradient_legend1 = pg.GradientLegend((10, 150), (-20, -20))
+        self.gradient_legend1.setParentItem(self.plot_cwt1.getViewBox())
+        self.gradient_legend1.setGradient(self.cwt_cmap.getGradient())
+        self.gradient_legend1.setLabels({'0 dB': 1.0, '-60 dB': 0.0})
+
+        self.gradient_legend2 = pg.GradientLegend((10, 150), (-20, -20))
+        self.gradient_legend2.setParentItem(self.plot_cwt2.getViewBox())
+        self.gradient_legend2.setGradient(self.cwt_cmap.getGradient())
+        self.gradient_legend2.setLabels({'0 dB': 1.0, '-60 dB': 0.0})
 
         # Link X axes
         self.plot_ch2.setXLink(self.plot_ch1)
@@ -1148,11 +1156,12 @@ class PiezoCapture(QtWidgets.QMainWindow):
         # CWT analysis (10-1000 Hz)
         sample_rate = len(wf1) / (self.hdiv * 14)
 
-        # Downsample for faster CWT computation
-        ds_factor = max(1, len(wf1) // 2000)
+        # Downsample for faster CWT computation - keep more samples for time resolution
+        ds_factor = max(1, len(wf1) // 4000)
         wf1_ds = wf1[::ds_factor]
         wf2_ds = wf2[::ds_factor]
         sample_rate_ds = sample_rate / ds_factor
+        print(f"CWT: {len(wf1)} -> {len(wf1_ds)} samples (ds={ds_factor}), sample_rate={sample_rate_ds:.0f} Hz")
 
         # Compute CWT correlation
         cwt_result = cwt_correlation(wf1_ds, wf2_ds, sample_rate_ds,
@@ -1166,21 +1175,40 @@ class PiezoCapture(QtWidgets.QMainWindow):
         vmin = min(np.percentile(power1_db, 5), np.percentile(power2_db, 5))
         vmax = max(np.percentile(power1_db, 95), np.percentile(power2_db, 95))
 
-        # Set image data with proper scaling
-        # ImageItem expects (rows=Y, cols=X), power_db is (freq, time) which is correct
-        self.img_cwt1.setImage(power1_db, levels=(vmin, vmax))
-        self.img_cwt2.setImage(power2_db, levels=(vmin, vmax))
+        # Debug: print CWT data stats
+        print(f"CWT debug: power1 shape={power1_db.shape}, range=[{power1_db.min():.1f}, {power1_db.max():.1f}] dB")
+        print(f"  Time variation check: std along time axis = {np.std(power1_db, axis=1).mean():.2f}")
+
+        # Set image data
+        # power1_db shape is (freq, time), need (time, freq) for pyqtgraph X=time, Y=freq
+        # Also flip vertically so low frequencies are at bottom
+        img1 = np.flipud(power1_db).T
+        img2 = np.flipud(power2_db).T
+        self.img_cwt1.setImage(img1, levels=(vmin, vmax))
+        self.img_cwt2.setImage(img2, levels=(vmin, vmax))
 
         # Apply colormap
         self.img_cwt1.setLookupTable(self.cwt_cmap.getLookupTable())
         self.img_cwt2.setLookupTable(self.cwt_cmap.getLookupTable())
 
-        # Update colorbar range
-        self.colorbar.setLevels(values=(vmin, vmax))
-
         # Scale the images to match time and frequency axes
-        self.img_cwt1.setRect(0, 10, total_time, 990)
-        self.img_cwt2.setRect(0, 10, total_time, 990)
+        # Get the actual frequency range used
+        freqs = cwt_result['freqs']
+        freq_min, freq_max = freqs[0], freqs[-1]
+
+        self.img_cwt1.setRect(0, freq_min, total_time, freq_max - freq_min)
+        self.img_cwt2.setRect(0, freq_min, total_time, freq_max - freq_min)
+
+        # Set plot ranges to match
+        self.plot_cwt1.setXRange(0, total_time, padding=0)
+        self.plot_cwt1.setYRange(freq_min, freq_max, padding=0)
+        self.plot_cwt2.setXRange(0, total_time, padding=0)
+        self.plot_cwt2.setYRange(freq_min, freq_max, padding=0)
+
+        # Update gradient legend labels (label: position)
+        labels = {f'{vmax:.0f} dB': 1.0, f'{vmin:.0f} dB': 0.0}
+        self.gradient_legend1.setLabels(labels)
+        self.gradient_legend2.setLabels(labels)
 
         # Update CWT metrics labels
         self.cwt_coherence_label.setText(f"{cwt_result['cwt_coherence']:.3f}")
