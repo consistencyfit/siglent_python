@@ -345,7 +345,7 @@ class PiezoCapture(QtWidgets.QMainWindow):
         self.arm_btn.clicked.connect(self._toggle_trigger)
         controls.addWidget(self.arm_btn)
 
-        self.capture_btn = QtWidgets.QPushButton('Capture')
+        self.capture_btn = QtWidgets.QPushButton('ManualCapture')
         self.capture_btn.clicked.connect(self._manual_capture)
         controls.addWidget(self.capture_btn)
 
