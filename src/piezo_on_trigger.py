@@ -334,7 +334,7 @@ class PiezoCapture(QtWidgets.QMainWindow):
         self.ch1_vdiv = 0.07
         self.ch2_vdiv = 0.07
         self.hdiv = 0.02
-        self.trigger_level = 0.005
+        self.trigger_level = 0.0025
         self.capture_count = 0
         self.running = False
 
@@ -344,7 +344,7 @@ class PiezoCapture(QtWidgets.QMainWindow):
         self.interpolate_enabled = True
         self.upsample_factor = 4
         self.envelope_smooth = 201  # Larger window for smoother envelope
-        self.trigger_delay_ms = -120  # Horizontal trigger delay in ms
+        self.trigger_delay_ms = -40  # Horizontal trigger delay in ms
         self.show_onset_markers = False
         self.current_time_array = None  # Store time array for onset marker positioning
 
@@ -444,6 +444,17 @@ class PiezoCapture(QtWidgets.QMainWindow):
         self.delay_spin.valueChanged.connect(self._on_delay_changed)
         controls.addWidget(self.delay_spin)
 
+        # Trigger level control
+        controls.addWidget(QtWidgets.QLabel('Trig:'))
+        self.trig_spin = QtWidgets.QDoubleSpinBox()
+        self.trig_spin.setRange(0.001, 1.0)
+        self.trig_spin.setSingleStep(0.005)
+        self.trig_spin.setDecimals(3)
+        self.trig_spin.setValue(self.trigger_level)
+        self.trig_spin.setSuffix(' V')
+        self.trig_spin.valueChanged.connect(self._on_trigger_level_changed)
+        controls.addWidget(self.trig_spin)
+
         controls.addSpacing(10)
 
         # Onset markers toggle
@@ -538,8 +549,13 @@ class PiezoCapture(QtWidgets.QMainWindow):
         self.curve_ch1_env_upper = self.plot_ch1.plot(pen=pg.mkPen('r', width=1.5))
         self.curve_ch1_env_lower = self.plot_ch1.plot(pen=pg.mkPen('r', width=1.5))
         self.onset_marker_ch1 = pg.InfiniteLine(pos=0, angle=90, pen=pg.mkPen(color=(0, 255, 0), width=3))
+        self.onset_marker_ch1.setZValue(1000)  # Bring to front
         self.onset_marker_ch1.setVisible(False)
         self.plot_ch1.addItem(self.onset_marker_ch1)
+        self.onset_label_ch1 = pg.TextItem(text='', color=(0, 255, 0), anchor=(0, 0))
+        self.onset_label_ch1.setZValue(1001)
+        self.onset_label_ch1.setVisible(False)
+        self.plot_ch1.addItem(self.onset_label_ch1, ignoreBounds=True)
 
         # CH2 waveform + envelope
         self.plot_ch2 = self.graphics.addPlot(row=1, col=0, title='CH2 Waveform + Envelope')
@@ -550,8 +566,13 @@ class PiezoCapture(QtWidgets.QMainWindow):
         self.curve_ch2_env_upper = self.plot_ch2.plot(pen=pg.mkPen('m', width=1.5))
         self.curve_ch2_env_lower = self.plot_ch2.plot(pen=pg.mkPen('m', width=1.5))
         self.onset_marker_ch2 = pg.InfiniteLine(pos=0, angle=90, pen=pg.mkPen(color=(0, 255, 0), width=3))
+        self.onset_marker_ch2.setZValue(1000)  # Bring to front
         self.onset_marker_ch2.setVisible(False)
         self.plot_ch2.addItem(self.onset_marker_ch2)
+        self.onset_label_ch2 = pg.TextItem(text='', color=(0, 255, 0), anchor=(0, 0))
+        self.onset_label_ch2.setZValue(1001)
+        self.onset_label_ch2.setVisible(False)
+        self.plot_ch2.addItem(self.onset_label_ch2, ignoreBounds=True)
 
         # FFT plots
         self.plot_fft1 = self.graphics.addPlot(row=0, col=1, title='CH1 FFT')
@@ -629,8 +650,9 @@ class PiezoCapture(QtWidgets.QMainWindow):
         print(f"Setting horizontal: {self.hdiv*1000:.0f}ms/div")
         send_command(self.sock, f'TDIV {self.hdiv}')
         delay_sec = self.trigger_delay_ms / 1000.0
-        print(f"Setting horizontal delay: {self.trigger_delay_ms}ms")
+        print(f"Setting horizontal delay: {self.trigger_delay_ms}ms -> TRDL {delay_sec}")
         send_command(self.sock, f'TRDL {delay_sec}')
+        print(f"  Verify delay: {query(self.sock, 'TRDL?')}")
 
         # Trigger
         print(f"Setting trigger: C1 @ {self.trigger_level}V")
@@ -716,16 +738,20 @@ class PiezoCapture(QtWidgets.QMainWindow):
         self.peak_lag_label.setText(f"{corr['peak_lag_samples']} samples")
         self.amp_ratio_label.setText(f"{corr['amplitude_ratio']:.3f}")
 
-        # Update onset markers
+        # Update onset markers and labels
         if self.current_time_array is not None:
             onset1_idx = corr['onset1_idx']
             onset2_idx = corr['onset2_idx']
             if onset1_idx < len(self.current_time_array):
                 t1 = self.current_time_array[onset1_idx]
                 self.onset_marker_ch1.setPos(t1)
+                self.onset_label_ch1.setText(f't={t1:.1f}ms')
+                self.onset_label_ch1.setPos(t1, getattr(self, 'env1_max_mv', 50) * 0.9)
             if onset2_idx < len(self.current_time_array):
                 t2 = self.current_time_array[onset2_idx]
                 self.onset_marker_ch2.setPos(t2)
+                self.onset_label_ch2.setText(f't={t2:.1f}ms')
+                self.onset_label_ch2.setPos(t2, getattr(self, 'env2_max_mv', 50) * 0.9)
 
     def _arm_trigger(self, force_mode=False):
         """Arm the trigger. In NORMAL mode, scope auto-rearms so we just clear INR."""
@@ -763,14 +789,24 @@ class PiezoCapture(QtWidgets.QMainWindow):
         self.trigger_delay_ms = value
         if self.sock:
             delay_sec = value / 1000.0
+            print(f"Setting delay: {value}ms -> TRDL {delay_sec}")
             # Send directly without blocking *OPC? for responsive GUI
             self.sock.sendall(f'TRDL {delay_sec}\n'.encode())
+
+    def _on_trigger_level_changed(self, value):
+        """Handle trigger level change."""
+        self.trigger_level = value
+        if self.sock:
+            print(f"Setting trigger level: {value}V")
+            self.sock.sendall(f'C1:TRLV {value}V\n'.encode())
 
     def _on_onset_markers_changed(self, state):
         """Toggle onset marker visibility."""
         self.show_onset_markers = bool(state)
         self.onset_marker_ch1.setVisible(self.show_onset_markers)
         self.onset_marker_ch2.setVisible(self.show_onset_markers)
+        self.onset_label_ch1.setVisible(self.show_onset_markers)
+        self.onset_label_ch2.setVisible(self.show_onset_markers)
 
     def _apply_waveform_settings(self):
         """Apply current decimation settings to scope."""
@@ -930,16 +966,26 @@ class PiezoCapture(QtWidgets.QMainWindow):
         time_axis = np.linspace(0, total_time, len(wf1))
         self.current_time_array = time_axis  # Store for onset markers
 
+        # Store max envelope values for label positioning (in mV)
+        self.env1_max_mv = np.max(env1) * 1000
+        self.env2_max_mv = np.max(env2) * 1000
+
         # CH1 waveform + envelope
         self.curve_ch1.setData(time_axis, wf1 * 1000)
         self.curve_ch1_env_upper.setData(time_axis[:len(env1)], env1 * 1000)
         self.curve_ch1_env_lower.setData(time_axis[:len(env1)], -env1 * 1000)
+
+        # Update onset label Y positions to top of envelope
+        self.onset_label_ch1.setPos(self.onset_marker_ch1.value(), self.env1_max_mv * 0.9)
 
         # CH2 waveform + envelope
         time_axis2 = np.linspace(0, total_time, len(wf2))
         self.curve_ch2.setData(time_axis2, wf2 * 1000)
         self.curve_ch2_env_upper.setData(time_axis2[:len(env2)], env2 * 1000)
         self.curve_ch2_env_lower.setData(time_axis2[:len(env2)], -env2 * 1000)
+
+        # Update onset label Y positions to top of envelope
+        self.onset_label_ch2.setPos(self.onset_marker_ch2.value(), self.env2_max_mv * 0.9)
 
         # FFT and spectral centroids
         sample_rate = len(wf1) / (self.hdiv * 14)
